@@ -9,6 +9,7 @@ Track design ideas, operational learnings, and architectural insights.
 3. Homeostasis controllers (uncertainty/budget/error) reduce thrashing and unsafe action escalation.
 4. Keeping tool side effects behind capability + sandbox boundaries is essential for trustworthy automation.
 5. Reusing one OpenAPI live-validation script across CI and pre-push hooks prevents contract drift between local and hosted checks.
+6. "Optimal filesystem" for agents is a layered substrate (journal + blob CAS + manifest projection + workspace view), not a single host FS choice.
 
 ## Working Ideas
 

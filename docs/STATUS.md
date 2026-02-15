@@ -21,6 +21,7 @@ Last updated: 2026-02-15
 9. Vercel AI SDK v6 UIMessage stream adapter endpoint with typed data-part mapping.
 10. OpenAPI 3.1 spec endpoint and Scalar interactive docs route.
 11. CI OpenAPI schema validation and pre-commit/pre-push hook configuration.
+12. Filesystem + harness architecture evaluation with Lago fit/gap analysis.
 
 ## In Progress / Partial
 
