@@ -8,6 +8,7 @@ Track design ideas, operational learnings, and architectural insights.
 2. Session is the correct execution unit for agent work; process-level analogies are insufficient.
 3. Homeostasis controllers (uncertainty/budget/error) reduce thrashing and unsafe action escalation.
 4. Keeping tool side effects behind capability + sandbox boundaries is essential for trustworthy automation.
+5. Reusing one OpenAPI live-validation script across CI and pre-push hooks prevents contract drift between local and hosted checks.
 
 ## Working Ideas
 

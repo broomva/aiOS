@@ -27,6 +27,7 @@ Build and operate `aiOS` as a safe, event-native, session-oriented agent operati
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
+- `scripts/validate_openapi_live.sh`
 
 5. Update docs with behavior changes:
 - Update `README.md` for user-facing changes.

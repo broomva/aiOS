@@ -31,3 +31,4 @@ Use this checklist before production release/distribution.
 1. Validate API contracts and migration notes for any breaking change.
 2. Validate SSE replay behavior and reconnect semantics.
 3. Validate docs and examples for operators and integrators.
+4. Validate generated `/openapi.json` against OpenAPI schema.

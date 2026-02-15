@@ -1,0 +1,31 @@
+repos:
+  - repo: local
+    hooks:
+      - id: rust-fmt
+        name: rust fmt
+        entry: cargo fmt --all --check
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: openapi-schema-validate
+        name: openapi schema validate
+        entry: scripts/validate_openapi_live.py
+        language: python
+        additional_dependencies: [openapi-spec-validator==0.7.2]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: rust-clippy
+        name: rust clippy
+        entry: cargo clippy --workspace --all-targets --locked -- -D warnings
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: rust-test
+        name: rust test
+        entry: cargo test --workspace --locked
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

@@ -289,6 +289,33 @@ pub enum EventKind {
         exit_status: i32,
         outcome: ToolOutcome,
     },
+    VoiceSessionStarted {
+        voice_session_id: Uuid,
+        adapter: String,
+        model: String,
+        sample_rate_hz: u32,
+        channels: u8,
+    },
+    VoiceInputChunk {
+        voice_session_id: Uuid,
+        chunk_index: u64,
+        bytes: usize,
+        format: String,
+    },
+    VoiceOutputChunk {
+        voice_session_id: Uuid,
+        chunk_index: u64,
+        bytes: usize,
+        format: String,
+    },
+    VoiceSessionStopped {
+        voice_session_id: Uuid,
+        reason: String,
+    },
+    VoiceAdapterError {
+        voice_session_id: Uuid,
+        message: String,
+    },
     FileMutated {
         path: String,
         content_hash: String,

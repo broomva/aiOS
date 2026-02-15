@@ -115,3 +115,17 @@ All important state transitions become `EventKind` records. This supports:
 - replay from cursor
 - auditability and postmortems
 - deterministic-enough recovery
+
+Interface adapters convert kernel-native events into client-native protocols without changing
+runtime semantics. Current adapters:
+- Native SSE (`/events/stream`) for raw `EventRecord`.
+- Vercel AI SDK v6 UIMessage stream (`/events/stream/vercel-ai-sdk-v6`) with
+  `x-vercel-ai-ui-message-stream: v1` and typed custom `data-aios-event` parts.
+- OpenAPI/Docs adapter: `/openapi.json` + Scalar UI at `/docs`.
+
+The event model now also includes first-slice voice events:
+- `voice_session_started`
+- `voice_input_chunk`
+- `voice_output_chunk`
+- `voice_session_stopped`
+- `voice_adapter_error`

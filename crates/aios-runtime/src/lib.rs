@@ -303,6 +303,20 @@ impl KernelRuntime {
         self.journal.subscribe()
     }
 
+    pub async fn record_external_event(
+        &self,
+        session_id: SessionId,
+        kind: EventKind,
+    ) -> Result<()> {
+        {
+            let sessions = self.sessions.lock();
+            if !sessions.contains_key(&session_id) {
+                bail!("session not found: {}", session_id.0);
+            }
+        }
+        self.append_event(session_id, kind).await
+    }
+
     pub async fn read_events(
         &self,
         session_id: SessionId,

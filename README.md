@@ -28,10 +28,15 @@ cargo run -p aios-api -- --root .aios --listen 127.0.0.1:8787
 ```
 
 Core endpoints:
+- `GET /openapi.json`
+- `GET /docs` (Scalar interactive docs)
 - `POST /sessions`
 - `POST /sessions/{session_id}/ticks`
 - `GET /sessions/{session_id}/events`
 - `GET /sessions/{session_id}/events/stream?cursor=0` (SSE replay + live tail)
+- `GET /sessions/{session_id}/events/stream/vercel-ai-sdk-v6?cursor=0` (Vercel AI SDK v6 UIMessage stream protocol)
+- `POST /sessions/{session_id}/voice/start`
+- `GET /sessions/{session_id}/voice/stream?voice_session_id=...` (WebSocket)
 
 ## Quality Gate
 
@@ -41,6 +46,22 @@ Run the same checks locally that CI runs:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+scripts/validate_openapi_live.sh
+```
+
+## Pre-Commit Hooks
+
+This repository includes `.pre-commit-config.yaml` with:
+- `pre-commit`: `cargo fmt --all --check`
+- `pre-push`: OpenAPI validation, clippy, and tests
+
+Install:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install pre-commit openapi-spec-validator==0.7.2
+pre-commit install --hook-type pre-commit --hook-type pre-push
 ```
 
 ## Docs

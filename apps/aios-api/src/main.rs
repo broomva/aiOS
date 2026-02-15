@@ -1,29 +1,46 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aios_kernel::{AiosKernel, KernelBuilder};
 use aios_model::{
-    AgentStateVector, Capability, EventRecord, ModelRouting, OperatingMode, PolicySet, SessionId,
-    SessionManifest, ToolCall,
+    AgentStateVector, Capability, EventKind, EventRecord, ModelRouting, OperatingMode, PolicySet,
+    SessionId, SessionManifest, ToolCall,
 };
 use anyhow::Result;
 use async_stream::stream;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::header::CACHE_CONTROL;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::Html;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use uuid::Uuid;
+
+mod openapi;
+mod vercel_v6;
+mod voice;
+
+use crate::openapi::{openapi_spec, scalar_docs_html};
+use crate::vercel_v6::{
+    VERCEL_AI_SDK_V6_STREAM_HEADER, VERCEL_AI_SDK_V6_STREAM_VERSION, kernel_event_parts,
+    part_as_sse_event,
+};
+use crate::voice::{PersonaplexProcessContract, StubPersonaplexAdapter, VoiceSessionConfig};
 
 #[derive(Debug, Parser)]
 #[command(name = "aios-api")]
@@ -38,6 +55,14 @@ struct Cli {
 #[derive(Clone)]
 struct AppState {
     kernel: AiosKernel,
+    voice_adapter: StubPersonaplexAdapter,
+    voice_sessions: Arc<RwLock<HashMap<Uuid, ActiveVoiceSession>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveVoiceSession {
+    session_id: SessionId,
+    format: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -95,6 +120,31 @@ struct EventStreamQuery {
     replay_limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct VoiceStartRequest {
+    role_prompt: Option<String>,
+    voice_prompt_ref: Option<String>,
+    sample_rate_hz: Option<u32>,
+    channels: Option<u8>,
+    format: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VoiceStartResponse {
+    session_id: SessionId,
+    voice_session_id: Uuid,
+    model: String,
+    sample_rate_hz: u32,
+    channels: u8,
+    format: String,
+    ws_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct VoiceStreamQuery {
+    voice_session_id: String,
+}
+
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -134,15 +184,32 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let kernel = KernelBuilder::new(&cli.root).build();
+    let voice_adapter = StubPersonaplexAdapter::new(PersonaplexProcessContract::default());
 
-    let state = AppState { kernel };
+    let state = AppState {
+        kernel,
+        voice_adapter,
+        voice_sessions: Arc::new(RwLock::new(HashMap::new())),
+    };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/openapi.json", get(openapi_json))
+        .route("/docs", get(docs))
+        .route("/docs/", get(docs))
         .route("/sessions", post(create_session))
         .route("/sessions/{session_id}/ticks", post(tick_session))
         .route("/sessions/{session_id}/events", get(list_events))
         .route("/sessions/{session_id}/events/stream", get(stream_events))
+        .route(
+            "/sessions/{session_id}/events/stream/vercel-ai-sdk-v6",
+            get(stream_events_vercel_ai_sdk_v6),
+        )
+        .route(
+            "/sessions/{session_id}/voice/start",
+            post(start_voice_session),
+        )
+        .route("/sessions/{session_id}/voice/stream", get(stream_voice_ws))
         .route(
             "/sessions/{session_id}/approvals/{approval_id}",
             post(resolve_approval),
@@ -166,6 +233,14 @@ async fn healthz() -> Json<serde_json::Value> {
         "status": "ok",
         "service": "aios-api"
     }))
+}
+
+async fn openapi_json() -> Json<serde_json::Value> {
+    Json(openapi_spec())
+}
+
+async fn docs() -> Html<String> {
+    Html(scalar_docs_html("/openapi.json"))
 }
 
 async fn create_session(
@@ -287,6 +362,298 @@ async fn stream_events(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     ))
+}
+
+async fn stream_events_vercel_ai_sdk_v6(
+    Path(session_id): Path<String>,
+    Query(query): Query<EventStreamQuery>,
+    State(state): State<AppState>,
+) -> ApiResult<(
+    HeaderMap,
+    Sse<impl Stream<Item = Result<Event, Infallible>>>,
+)> {
+    let session_id = parse_session_id(&session_id)?;
+    let mut next_sequence = query.cursor.map_or(1, |cursor| cursor.saturating_add(1));
+    let replay_limit = query.replay_limit.unwrap_or(500).clamp(1, 5000);
+
+    let replay_events = state
+        .kernel
+        .read_events(session_id, next_sequence, replay_limit)
+        .await
+        .map_err(ApiError::internal)?;
+
+    if let Some(last_event) = replay_events.last() {
+        next_sequence = last_event.sequence.saturating_add(1);
+    }
+
+    let mut subscription = state.kernel.subscribe_events();
+    let stream = stream! {
+        for event in replay_events {
+            for part in kernel_event_parts(&event) {
+                yield Ok(part_as_sse_event(&part));
+            }
+        }
+
+        let mut expected_sequence = next_sequence;
+        loop {
+            match subscription.recv().await {
+                Ok(event) => {
+                    if event.session_id != session_id || event.sequence < expected_sequence {
+                        continue;
+                    }
+
+                    expected_sequence = event.sequence.saturating_add(1);
+                    for part in kernel_event_parts(&event) {
+                        yield Ok(part_as_sse_event(&part));
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    let lag_payload = json!({
+                        "type": "data-aios-stream-status",
+                        "data": {
+                            "status": "lagged",
+                            "skipped": skipped,
+                        },
+                    })
+                    .to_string();
+                    yield Ok(Event::default().data(lag_payload));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    yield Ok(Event::default().data("[DONE]"));
+                    break;
+                }
+            }
+        }
+    };
+
+    let sse = Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        VERCEL_AI_SDK_V6_STREAM_HEADER,
+        HeaderValue::from_static(VERCEL_AI_SDK_V6_STREAM_VERSION),
+    );
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+
+    Ok((headers, sse))
+}
+
+async fn start_voice_session(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<VoiceStartRequest>,
+) -> ApiResult<Json<VoiceStartResponse>> {
+    let session_id = parse_session_id(&session_id)?;
+    let sample_rate_hz = request.sample_rate_hz.unwrap_or(24_000);
+    let channels = request.channels.unwrap_or(1);
+
+    if channels == 0 {
+        return Err(ApiError::bad_request("channels must be >= 1"));
+    }
+
+    let format = request
+        .format
+        .unwrap_or_else(|| format!("audio/pcm;rate={sample_rate_hz}"));
+
+    let config = VoiceSessionConfig {
+        role_prompt: request.role_prompt,
+        voice_prompt_ref: request.voice_prompt_ref,
+        sample_rate_hz,
+        channels,
+        format: format.clone(),
+    };
+
+    let voice_session_id = state
+        .voice_adapter
+        .start_session(session_id.0, &config)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let contract = state.voice_adapter.contract().clone();
+
+    state.voice_sessions.write().await.insert(
+        voice_session_id,
+        ActiveVoiceSession {
+            session_id,
+            format: format.clone(),
+        },
+    );
+
+    state
+        .kernel
+        .record_external_event(
+            session_id,
+            EventKind::VoiceSessionStarted {
+                voice_session_id,
+                adapter: contract.command,
+                model: contract.model_id.clone(),
+                sample_rate_hz,
+                channels,
+            },
+        )
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(VoiceStartResponse {
+        session_id,
+        voice_session_id,
+        model: contract.model_id,
+        sample_rate_hz,
+        channels,
+        format,
+        ws_path: format!(
+            "/sessions/{}/voice/stream?voice_session_id={voice_session_id}",
+            session_id.0
+        ),
+    }))
+}
+
+async fn stream_voice_ws(
+    Path(session_id): Path<String>,
+    Query(query): Query<VoiceStreamQuery>,
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> ApiResult<Response> {
+    let session_id = parse_session_id(&session_id)?;
+    let voice_session_id = Uuid::parse_str(&query.voice_session_id)
+        .map_err(|error| ApiError::bad_request(format!("invalid voice session id: {error}")))?;
+
+    let voice_state = {
+        let guard = state.voice_sessions.read().await;
+        guard.get(&voice_session_id).cloned().ok_or_else(|| {
+            ApiError::bad_request(format!("voice session not found: {voice_session_id}"))
+        })?
+    };
+
+    if voice_state.session_id != session_id {
+        return Err(ApiError::bad_request(
+            "voice session does not belong to requested session",
+        ));
+    }
+
+    Ok(ws.on_upgrade(move |socket| {
+        handle_voice_socket(state, voice_state, voice_session_id, socket)
+    }))
+}
+
+async fn handle_voice_socket(
+    state: AppState,
+    voice_state: ActiveVoiceSession,
+    voice_session_id: Uuid,
+    mut socket: WebSocket,
+) {
+    let mut input_chunks = 0_u64;
+    let mut output_chunks = 0_u64;
+
+    loop {
+        let next = socket.next().await;
+        let Some(message) = next else {
+            break;
+        };
+
+        match message {
+            Ok(Message::Binary(audio_chunk)) => {
+                input_chunks += 1;
+                let _ = state
+                    .kernel
+                    .record_external_event(
+                        voice_state.session_id,
+                        EventKind::VoiceInputChunk {
+                            voice_session_id,
+                            chunk_index: input_chunks,
+                            bytes: audio_chunk.len(),
+                            format: voice_state.format.clone(),
+                        },
+                    )
+                    .await;
+
+                match state
+                    .voice_adapter
+                    .process_audio_chunk(voice_session_id, &audio_chunk)
+                    .await
+                {
+                    Ok(output_chunk) => {
+                        output_chunks += 1;
+                        let _ = state
+                            .kernel
+                            .record_external_event(
+                                voice_state.session_id,
+                                EventKind::VoiceOutputChunk {
+                                    voice_session_id,
+                                    chunk_index: output_chunks,
+                                    bytes: output_chunk.len(),
+                                    format: voice_state.format.clone(),
+                                },
+                            )
+                            .await;
+
+                        if socket
+                            .send(Message::Binary(output_chunk.into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = state
+                            .kernel
+                            .record_external_event(
+                                voice_state.session_id,
+                                EventKind::VoiceAdapterError {
+                                    voice_session_id,
+                                    message: error.to_string(),
+                                },
+                            )
+                            .await;
+                        break;
+                    }
+                }
+            }
+            Ok(Message::Text(text)) => {
+                if text.trim().eq_ignore_ascii_case("stop") {
+                    break;
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(Message::Ping(payload)) => {
+                if socket.send(Message::Pong(payload)).await.is_err() {
+                    break;
+                }
+            }
+            Ok(Message::Pong(_)) => {}
+            Err(error) => {
+                let _ = state
+                    .kernel
+                    .record_external_event(
+                        voice_state.session_id,
+                        EventKind::VoiceAdapterError {
+                            voice_session_id,
+                            message: error.to_string(),
+                        },
+                    )
+                    .await;
+                break;
+            }
+        }
+    }
+
+    let _ = state.voice_adapter.stop_session(voice_session_id).await;
+    let _ = state
+        .kernel
+        .record_external_event(
+            voice_state.session_id,
+            EventKind::VoiceSessionStopped {
+                voice_session_id,
+                reason: "websocket disconnected".to_owned(),
+            },
+        )
+        .await;
+    state.voice_sessions.write().await.remove(&voice_session_id);
 }
 
 async fn resolve_approval(

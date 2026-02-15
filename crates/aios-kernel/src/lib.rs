@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use aios_events::{EventJournal, EventStreamHub, FileEventStore};
 use aios_memory::WorkspaceMemoryStore;
-use aios_model::{EventRecord, ModelRouting, PolicySet, SessionId, SessionManifest, ToolCall};
+use aios_model::{
+    EventKind, EventRecord, ModelRouting, PolicySet, SessionId, SessionManifest, ToolCall,
+};
 use aios_policy::{ApprovalQueue, SessionPolicyEngine};
 use aios_runtime::{KernelRuntime, RuntimeConfig, TickInput, TickOutput};
 use aios_sandbox::LocalSandboxRunner;
@@ -113,6 +115,14 @@ impl AiosKernel {
 
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EventRecord> {
         self.runtime.subscribe_events()
+    }
+
+    pub async fn record_external_event(
+        &self,
+        session_id: SessionId,
+        kind: EventKind,
+    ) -> Result<()> {
+        self.runtime.record_external_event(session_id, kind).await
     }
 
     pub async fn read_events(

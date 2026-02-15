@@ -17,6 +17,10 @@ Last updated: 2026-02-15
 5. Tool registry/dispatcher with initial built-in tools.
 6. Workspace persistence for manifests/checkpoints/tool reports/memory observations.
 7. Control-plane HTTP API and SSE replay/live streaming.
+8. Voice ingress first slice: voice session start, websocket audio stream loopback, and voice event types.
+9. Vercel AI SDK v6 UIMessage stream adapter endpoint with typed data-part mapping.
+10. OpenAPI 3.1 spec endpoint and Scalar interactive docs route.
+11. CI OpenAPI schema validation and pre-commit/pre-push hook configuration.
 
 ## In Progress / Partial
 

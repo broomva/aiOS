@@ -29,6 +29,14 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OpenAPI validator
+        run: python3 -m pip install --disable-pip-version-check openapi-spec-validator==0.7.2
+
       - name: Check
         run: cargo check --workspace --locked
 
@@ -40,3 +48,6 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace --locked
+
+      - name: Validate OpenAPI schema
+        run: scripts/validate_openapi_live.sh
