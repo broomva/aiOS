@@ -21,6 +21,18 @@ This runs a demo kernel session and executes three ticks:
 
 Event records are streamed to logs as they are appended.
 
+Run the HTTP control plane:
+
+```bash
+cargo run -p aios-api -- --root .aios --listen 127.0.0.1:8787
+```
+
+Core endpoints:
+- `POST /sessions`
+- `POST /sessions/{session_id}/ticks`
+- `GET /sessions/{session_id}/events`
+- `GET /sessions/{session_id}/events/stream?cursor=0` (SSE replay + live tail)
+
 ## Quality Gate
 
 Run the same checks locally that CI runs:
@@ -34,3 +46,12 @@ cargo test --workspace
 ## Docs
 
 - Architecture and crate boundaries: `docs/ARCHITECTURE.md`
+- Docs index: `docs/README.md`
+- Current status: `docs/STATUS.md`
+- Roadmap: `docs/ROADMAP.md`
+- Technical reference: `docs/REFERENCE.md`
+- Sources: `docs/SOURCES.md`
+- Ideas and insights: `docs/INSIGHTS.md`
+- Agent workflow contract and rules: `AGENTS.md`
+- Context bundle: `context/`
+- Project-local skills: `skills/`

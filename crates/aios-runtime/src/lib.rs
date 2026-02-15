@@ -303,6 +303,17 @@ impl KernelRuntime {
         self.journal.subscribe()
     }
 
+    pub async fn read_events(
+        &self,
+        session_id: SessionId,
+        from_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>> {
+        self.journal
+            .read_from(session_id, from_sequence, limit)
+            .await
+    }
+
     fn estimate_mode(&self, state: &AgentStateVector, pending_approvals: usize) -> OperatingMode {
         if pending_approvals > 0 {
             return OperatingMode::AskHuman;

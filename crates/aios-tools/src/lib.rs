@@ -56,7 +56,7 @@ impl ToolRegistry {
         registry.register(ToolDefinition {
             name: "fs.write".to_owned(),
             description: "Write a UTF-8 text file to the session workspace".to_owned(),
-            required_capabilities: vec![Capability::fs_write("/session/**")],
+            required_capabilities: vec![Capability::fs_write("/session/artifacts/**")],
             kind: ToolKind::FsWrite,
         });
 

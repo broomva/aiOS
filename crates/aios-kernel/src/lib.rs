@@ -114,6 +114,17 @@ impl AiosKernel {
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EventRecord> {
         self.runtime.subscribe_events()
     }
+
+    pub async fn read_events(
+        &self,
+        session_id: SessionId,
+        from_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>> {
+        self.runtime
+            .read_events(session_id, from_sequence, limit)
+            .await
+    }
 }
 
 #[cfg(test)]

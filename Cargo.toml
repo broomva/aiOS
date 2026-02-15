@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "apps/aios-api",
   "apps/aiosd",
   "crates/aios-events",
   "crates/aios-kernel",
@@ -29,12 +30,16 @@ tokio = { version = "1.46", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 uuid = { version = "1.18", features = ["v4", "serde"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 parking_lot = "0.12"
 clap = { version = "4.5", features = ["derive"] }
 indexmap = { version = "2.11", features = ["serde"] }
 sha2 = "0.10"
 hex = "0.4"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+futures-util = "0.3"
+async-stream = "0.3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
