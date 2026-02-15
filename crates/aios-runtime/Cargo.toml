@@ -1,0 +1,25 @@
+[package]
+name = "aios-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aios-events = { path = "../aios-events" }
+aios-memory = { path = "../aios-memory" }
+aios-model = { path = "../aios-model" }
+aios-policy = { path = "../aios-policy" }
+aios-tools = { path = "../aios-tools" }
+anyhow.workspace = true
+chrono.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

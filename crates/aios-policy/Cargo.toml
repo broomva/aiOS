@@ -1,0 +1,17 @@
+[package]
+name = "aios-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aios-model = { path = "../aios-model" }
+async-trait.workspace = true
+indexmap.workspace = true
+serde.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

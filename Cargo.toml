@@ -1,0 +1,46 @@
+[workspace]
+members = [
+  "apps/aiosd",
+  "crates/aios-events",
+  "crates/aios-kernel",
+  "crates/aios-memory",
+  "crates/aios-model",
+  "crates/aios-policy",
+  "crates/aios-runtime",
+  "crates/aios-sandbox",
+  "crates/aios-tools",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+authors = ["aiOS contributors"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.46", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+uuid = { version = "1.18", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+parking_lot = "0.12"
+clap = { version = "4.5", features = ["derive"] }
+indexmap = { version = "2.11", features = ["serde"] }
+sha2 = "0.10"
+hex = "0.4"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"

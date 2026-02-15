@@ -1,0 +1,17 @@
+[package]
+name = "aios-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aios-model = { path = "../aios-model" }
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
