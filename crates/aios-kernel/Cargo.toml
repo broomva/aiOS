@@ -8,7 +8,7 @@ authors.workspace = true
 [dependencies]
 aios-events = { path = "../aios-events" }
 aios-memory = { path = "../aios-memory" }
-aios-model = { path = "../aios-model" }
+aios-protocol = { path = "../aios-protocol" }
 aios-policy = { path = "../aios-policy" }
 aios-runtime = { path = "../aios-runtime" }
 aios-sandbox = { path = "../aios-sandbox" }

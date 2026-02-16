@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aios_model::{Capability, PolicySet, SessionId};
+use aios_protocol::{Capability, PolicySet, SessionId};
 use async_trait::async_trait;
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
@@ -69,7 +69,7 @@ impl StaticPolicyEngine {
 
     fn set_contains(set: &[Capability], requested: &Capability) -> bool {
         set.iter()
-            .any(|candidate| Self::matches(&candidate.0, &requested.0))
+            .any(|candidate| Self::matches(candidate.as_str(), requested.as_str()))
     }
 }
 
@@ -109,7 +109,7 @@ impl PolicyEngine for StaticPolicyEngine {
 #[derive(Debug, Clone)]
 pub struct SessionPolicyEngine {
     default: StaticPolicyEngine,
-    overrides: Arc<RwLock<HashMap<SessionId, StaticPolicyEngine>>>,
+    overrides: Arc<RwLock<HashMap<String, StaticPolicyEngine>>>,
 }
 
 impl SessionPolicyEngine {
@@ -120,11 +120,11 @@ impl SessionPolicyEngine {
         }
     }
 
-    pub async fn set_policy(&self, session_id: SessionId, policy: &PolicySet) {
-        self.overrides
-            .write()
-            .await
-            .insert(session_id, StaticPolicyEngine::from_policy_set(policy));
+    pub async fn set_policy(&self, session_id: &SessionId, policy: &PolicySet) {
+        self.overrides.write().await.insert(
+            session_id.as_str().to_owned(),
+            StaticPolicyEngine::from_policy_set(policy),
+        );
     }
 }
 
@@ -135,7 +135,13 @@ impl PolicyEngine for SessionPolicyEngine {
         session_id: SessionId,
         requested: &[Capability],
     ) -> PolicyEvaluation {
-        if let Some(engine) = self.overrides.read().await.get(&session_id).cloned() {
+        if let Some(engine) = self
+            .overrides
+            .read()
+            .await
+            .get(session_id.as_str())
+            .cloned()
+        {
             engine.evaluate_capabilities(session_id, requested).await
         } else {
             self.default
@@ -193,12 +199,12 @@ impl ApprovalQueue {
         }
     }
 
-    pub async fn pending_for_session(&self, session_id: SessionId) -> Vec<ApprovalTicket> {
+    pub async fn pending_for_session(&self, session_id: &SessionId) -> Vec<ApprovalTicket> {
         self.pending
             .read()
             .await
             .values()
-            .filter(|ticket| ticket.session_id == session_id)
+            .filter(|ticket| ticket.session_id == *session_id)
             .cloned()
             .collect()
     }
@@ -222,17 +228,17 @@ mod tests {
         };
 
         let engine = StaticPolicyEngine::from_policy_set(&policy);
-        let session_id = SessionId::new();
+        let session_id = SessionId::default();
 
         let allowed_eval = engine
-            .evaluate_capabilities(session_id, &[Capability::exec("echo")])
+            .evaluate_capabilities(session_id.clone(), &[Capability::exec("echo")])
             .await;
         assert_eq!(allowed_eval.allowed.len(), 1);
         assert!(allowed_eval.requires_approval.is_empty());
         assert!(allowed_eval.denied.is_empty());
 
         let gated_eval = engine
-            .evaluate_capabilities(session_id, &[Capability::new("payments:initiate")])
+            .evaluate_capabilities(session_id.clone(), &[Capability::new("payments:initiate")])
             .await;
         assert_eq!(gated_eval.requires_approval.len(), 1);
         assert!(gated_eval.allowed.is_empty());
@@ -256,8 +262,8 @@ mod tests {
         };
 
         let engine = SessionPolicyEngine::new(default_policy);
-        let base_session = SessionId::new();
-        let override_session = SessionId::new();
+        let base_session = SessionId::default();
+        let override_session = SessionId::default();
 
         let override_policy = PolicySet {
             allow_capabilities: vec![Capability::exec("*")],
@@ -265,7 +271,7 @@ mod tests {
             max_tool_runtime_secs: 10,
             max_events_per_turn: 10,
         };
-        engine.set_policy(override_session, &override_policy).await;
+        engine.set_policy(&override_session, &override_policy).await;
 
         let base_eval = engine
             .evaluate_capabilities(base_session, &[Capability::exec("echo")])

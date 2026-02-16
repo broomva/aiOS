@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aios_model::{BranchId, EventRecord, SessionId};
+use aios_protocol::{BranchId, EventRecord, SessionId};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -32,8 +32,8 @@ pub trait EventStore: Send + Sync {
 #[derive(Debug)]
 pub struct FileEventStore {
     root: PathBuf,
-    write_locks: Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
-    sequence_cache: Mutex<HashMap<(SessionId, BranchId), u64>>,
+    write_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    sequence_cache: Mutex<HashMap<(String, String), u64>>,
 }
 
 impl FileEventStore {
@@ -45,10 +45,10 @@ impl FileEventStore {
         }
     }
 
-    fn file_path(&self, session_id: SessionId) -> PathBuf {
+    fn file_path(&self, session_id: &SessionId) -> PathBuf {
         self.root
             .join("events")
-            .join(format!("{}.jsonl", session_id.0.hyphenated()))
+            .join(format!("{}.jsonl", session_id.as_str()))
     }
 
     async fn ensure_parent(path: &Path) -> Result<()> {
@@ -60,10 +60,10 @@ impl FileEventStore {
         Ok(())
     }
 
-    fn lock_for(&self, session_id: SessionId) -> Arc<tokio::sync::Mutex<()>> {
+    fn lock_for(&self, session_id: &SessionId) -> Arc<tokio::sync::Mutex<()>> {
         let mut guard = self.write_locks.lock();
         guard
-            .entry(session_id)
+            .entry(session_id.as_str().to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -93,17 +93,24 @@ impl FileEventStore {
         Ok(latest)
     }
 
-    fn cached_latest_sequence(&self, session_id: SessionId, branch_id: &BranchId) -> Option<u64> {
+    fn cached_latest_sequence(&self, session_id: &SessionId, branch_id: &BranchId) -> Option<u64> {
         self.sequence_cache
             .lock()
-            .get(&(session_id, branch_id.clone()))
+            .get(&(
+                session_id.as_str().to_owned(),
+                branch_id.as_str().to_owned(),
+            ))
             .copied()
     }
 
-    fn update_cached_sequence(&self, session_id: SessionId, branch_id: &BranchId, latest: u64) {
-        self.sequence_cache
-            .lock()
-            .insert((session_id, branch_id.clone()), latest);
+    fn update_cached_sequence(&self, session_id: &SessionId, branch_id: &BranchId, latest: u64) {
+        self.sequence_cache.lock().insert(
+            (
+                session_id.as_str().to_owned(),
+                branch_id.as_str().to_owned(),
+            ),
+            latest,
+        );
     }
 }
 
@@ -112,23 +119,23 @@ impl EventStore for FileEventStore {
     #[instrument(
         skip(self, event),
         fields(
-            session_id = %event.session_id.0,
-            branch = %event.branch_id.as_str(),
+            session_id = %event.session_id,
+            branch = %event.branch_id,
             sequence = event.sequence
         )
     )]
     async fn append(&self, event: &EventRecord) -> Result<()> {
-        let path = self.file_path(event.session_id);
+        let path = self.file_path(&event.session_id);
         Self::ensure_parent(&path).await?;
 
-        let lock = self.lock_for(event.session_id);
+        let lock = self.lock_for(&event.session_id);
         let _guard = lock.lock().await;
 
-        let latest = match self.cached_latest_sequence(event.session_id, &event.branch_id) {
+        let latest = match self.cached_latest_sequence(&event.session_id, &event.branch_id) {
             Some(latest) => latest,
             None => {
                 let latest = Self::scan_latest_sequence(&path, Some(&event.branch_id)).await?;
-                self.update_cached_sequence(event.session_id, &event.branch_id, latest);
+                self.update_cached_sequence(&event.session_id, &event.branch_id, latest);
                 latest
             }
         };
@@ -142,7 +149,7 @@ impl EventStore for FileEventStore {
             );
             bail!(
                 "sequence conflict for session {}: expected {}, got {}",
-                event.session_id.0,
+                event.session_id,
                 expected_sequence,
                 event.sequence
             );
@@ -159,14 +166,14 @@ impl EventStore for FileEventStore {
         file.write_all(line.as_bytes()).await?;
         file.write_all(b"\n").await?;
         file.flush().await?;
-        self.update_cached_sequence(event.session_id, &event.branch_id, event.sequence);
+        self.update_cached_sequence(&event.session_id, &event.branch_id, event.sequence);
         debug!("event appended to store");
         Ok(())
     }
 
     #[instrument(
         skip(self),
-        fields(session_id = %session_id.0, branch = ?branch_id.as_ref().map(|b| b.as_str()), from_sequence, limit)
+        fields(session_id = %session_id, branch = ?branch_id.as_ref().map(|b| b.as_str()), from_sequence, limit)
     )]
     async fn read_from(
         &self,
@@ -175,7 +182,7 @@ impl EventStore for FileEventStore {
         from_sequence: u64,
         limit: usize,
     ) -> Result<Vec<EventRecord>> {
-        let path = self.file_path(session_id);
+        let path = self.file_path(&session_id);
         if !fs::try_exists(&path).await.unwrap_or(false) {
             return Ok(Vec::new());
         }
@@ -208,7 +215,7 @@ impl EventStore for FileEventStore {
 
     #[instrument(
         skip(self),
-        fields(session_id = %session_id.0, branch = ?branch_id.as_ref().map(|b| b.as_str()))
+        fields(session_id = %session_id, branch = ?branch_id.as_ref().map(|b| b.as_str()))
     )]
     async fn latest_sequence(
         &self,
@@ -216,13 +223,13 @@ impl EventStore for FileEventStore {
         branch_id: Option<BranchId>,
     ) -> Result<u64> {
         let branch = branch_id.unwrap_or_default();
-        if let Some(latest) = self.cached_latest_sequence(session_id, &branch) {
+        if let Some(latest) = self.cached_latest_sequence(&session_id, &branch) {
             return Ok(latest);
         }
 
-        let path = self.file_path(session_id);
+        let path = self.file_path(&session_id);
         let latest = Self::scan_latest_sequence(&path, Some(&branch)).await?;
-        self.update_cached_sequence(session_id, &branch, latest);
+        self.update_cached_sequence(&session_id, &branch, latest);
         debug!(latest, "latest sequence resolved");
         Ok(latest)
     }
@@ -266,8 +273,8 @@ impl EventJournal {
     #[instrument(
         skip(self, event),
         fields(
-            session_id = %event.session_id.0,
-            branch = %event.branch_id.as_str(),
+            session_id = %event.session_id,
+            branch = %event.branch_id,
             sequence = event.sequence
         )
     )]
@@ -308,7 +315,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use aios_model::{BranchId, EventKind, EventRecord, LoopPhase, SessionId};
+    use aios_protocol::{BranchId, EventKind, EventRecord, LoopPhase, SessionId};
     use anyhow::Result;
     use tokio::fs;
 
@@ -326,10 +333,10 @@ mod tests {
     async fn file_event_store_appends_and_reads_in_sequence() -> Result<()> {
         let root = unique_test_root("aios-events");
         let store = FileEventStore::new(&root);
-        let session_id = SessionId::new();
+        let session_id = SessionId::default();
 
         let event1 = EventRecord::new(
-            session_id,
+            session_id.clone(),
             BranchId::main(),
             1,
             EventKind::PhaseEntered {
@@ -337,7 +344,7 @@ mod tests {
             },
         );
         let event2 = EventRecord::new(
-            session_id,
+            session_id.clone(),
             BranchId::main(),
             2,
             EventKind::PhaseEntered {
@@ -349,7 +356,7 @@ mod tests {
         store.append(&event2).await?;
 
         let from_two = store
-            .read_from(session_id, Some(BranchId::main()), 2, 10)
+            .read_from(session_id.clone(), Some(BranchId::main()), 2, 10)
             .await?;
         assert_eq!(from_two.len(), 1);
         assert_eq!(from_two[0].sequence, 2);
@@ -367,10 +374,10 @@ mod tests {
     async fn file_event_store_rejects_duplicate_sequence() -> Result<()> {
         let root = unique_test_root("aios-events-duplicate");
         let store = FileEventStore::new(&root);
-        let session_id = SessionId::new();
+        let session_id = SessionId::default();
 
         let event1 = EventRecord::new(
-            session_id,
+            session_id.clone(),
             BranchId::main(),
             1,
             EventKind::PhaseEntered {
@@ -378,7 +385,7 @@ mod tests {
             },
         );
         let duplicate = EventRecord::new(
-            session_id,
+            session_id.clone(),
             BranchId::main(),
             1,
             EventKind::PhaseEntered {
@@ -398,10 +405,10 @@ mod tests {
     async fn file_event_store_rejects_sequence_gap() -> Result<()> {
         let root = unique_test_root("aios-events-gap");
         let store = FileEventStore::new(&root);
-        let session_id = SessionId::new();
+        let session_id = SessionId::default();
 
         let first = EventRecord::new(
-            session_id,
+            session_id.clone(),
             BranchId::main(),
             1,
             EventKind::PhaseEntered {
@@ -409,7 +416,7 @@ mod tests {
             },
         );
         let gap = EventRecord::new(
-            session_id,
+            session_id.clone(),
             BranchId::main(),
             3,
             EventKind::PhaseEntered {
@@ -429,12 +436,12 @@ mod tests {
     async fn file_event_store_tracks_sequences_per_branch() -> Result<()> {
         let root = unique_test_root("aios-events-branch");
         let store = FileEventStore::new(&root);
-        let session_id = SessionId::new();
+        let session_id = SessionId::default();
         let main = BranchId::main();
-        let feature = BranchId::new("feature-x");
+        let feature = BranchId::from_string("feature-x");
 
         let main_event = EventRecord::new(
-            session_id,
+            session_id.clone(),
             main.clone(),
             1,
             EventKind::PhaseEntered {
@@ -442,7 +449,7 @@ mod tests {
             },
         );
         let feature_event = EventRecord::new(
-            session_id,
+            session_id.clone(),
             feature.clone(),
             1,
             EventKind::PhaseEntered {
@@ -453,15 +460,17 @@ mod tests {
         store.append(&feature_event).await?;
 
         let main_latest = store
-            .latest_sequence(session_id, Some(main.clone()))
+            .latest_sequence(session_id.clone(), Some(main.clone()))
             .await?;
         let feature_latest = store
-            .latest_sequence(session_id, Some(feature.clone()))
+            .latest_sequence(session_id.clone(), Some(feature.clone()))
             .await?;
         assert_eq!(main_latest, 1);
         assert_eq!(feature_latest, 1);
 
-        let main_events = store.read_from(session_id, Some(main), 1, 10).await?;
+        let main_events = store
+            .read_from(session_id.clone(), Some(main), 1, 10)
+            .await?;
         let feature_events = store.read_from(session_id, Some(feature), 1, 10).await?;
         assert_eq!(main_events.len(), 1);
         assert_eq!(feature_events.len(), 1);

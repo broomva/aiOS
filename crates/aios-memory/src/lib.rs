@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use aios_model::{
+use aios_protocol::{
     EventKind, EventRecord, FileProvenance, Observation, Provenance, SessionId, SoulProfile,
 };
 use anyhow::{Context, Result};
@@ -11,16 +11,16 @@ use uuid::Uuid;
 
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
-    async fn load_soul(&self, session_id: SessionId) -> Result<SoulProfile>;
-    async fn save_soul(&self, session_id: SessionId, soul: &SoulProfile) -> Result<()>;
+    async fn load_soul(&self, session_id: &SessionId) -> Result<SoulProfile>;
+    async fn save_soul(&self, session_id: &SessionId, soul: &SoulProfile) -> Result<()>;
     async fn append_observation(
         &self,
-        session_id: SessionId,
+        session_id: &SessionId,
         observation: &Observation,
     ) -> Result<()>;
     async fn list_observations(
         &self,
-        session_id: SessionId,
+        session_id: &SessionId,
         limit: usize,
     ) -> Result<Vec<Observation>>;
 }
@@ -35,17 +35,15 @@ impl WorkspaceMemoryStore {
         Self { root: root.into() }
     }
 
-    fn session_memory_dir(&self, session_id: SessionId) -> PathBuf {
-        self.root
-            .join(session_id.0.hyphenated().to_string())
-            .join("memory")
+    fn session_memory_dir(&self, session_id: &SessionId) -> PathBuf {
+        self.root.join(session_id.as_str()).join("memory")
     }
 
-    fn soul_path(&self, session_id: SessionId) -> PathBuf {
+    fn soul_path(&self, session_id: &SessionId) -> PathBuf {
         self.session_memory_dir(session_id).join("soul.json")
     }
 
-    fn observations_path(&self, session_id: SessionId) -> PathBuf {
+    fn observations_path(&self, session_id: &SessionId) -> PathBuf {
         self.session_memory_dir(session_id)
             .join("observations.jsonl")
     }
@@ -60,7 +58,7 @@ impl WorkspaceMemoryStore {
 
 #[async_trait]
 impl MemoryStore for WorkspaceMemoryStore {
-    async fn load_soul(&self, session_id: SessionId) -> Result<SoulProfile> {
+    async fn load_soul(&self, session_id: &SessionId) -> Result<SoulProfile> {
         let path = self.soul_path(session_id);
         if !fs::try_exists(&path).await.unwrap_or(false) {
             return Ok(SoulProfile::default());
@@ -74,7 +72,7 @@ impl MemoryStore for WorkspaceMemoryStore {
         Ok(soul)
     }
 
-    async fn save_soul(&self, session_id: SessionId, soul: &SoulProfile) -> Result<()> {
+    async fn save_soul(&self, session_id: &SessionId, soul: &SoulProfile) -> Result<()> {
         let path = self.soul_path(session_id);
         Self::ensure_parent(&path).await?;
 
@@ -87,7 +85,7 @@ impl MemoryStore for WorkspaceMemoryStore {
 
     async fn append_observation(
         &self,
-        session_id: SessionId,
+        session_id: &SessionId,
         observation: &Observation,
     ) -> Result<()> {
         let path = self.observations_path(session_id);
@@ -108,7 +106,7 @@ impl MemoryStore for WorkspaceMemoryStore {
 
     async fn list_observations(
         &self,
-        session_id: SessionId,
+        session_id: &SessionId,
         limit: usize,
     ) -> Result<Vec<Observation>> {
         let path = self.observations_path(session_id);
@@ -138,12 +136,17 @@ impl MemoryStore for WorkspaceMemoryStore {
 
 pub fn extract_observation(event: &EventRecord) -> Option<Observation> {
     let text = match &event.kind {
-        EventKind::ToolCallCompleted { outcome, .. } => {
-            format!("tool call completed: {outcome:?}")
+        EventKind::ToolCallCompleted {
+            tool_name,
+            result,
+            status,
+            ..
+        } => {
+            format!("tool call completed ({tool_name}): {result} [status={status:?}]")
         }
         EventKind::ErrorRaised { message } => format!("error observed: {message}"),
         EventKind::CheckpointCreated { checkpoint_id, .. } => {
-            format!("checkpoint created: {}", checkpoint_id.0)
+            format!("checkpoint created: {checkpoint_id}")
         }
         _ => return None,
     };
@@ -159,7 +162,7 @@ pub fn extract_observation(event: &EventRecord) -> Option<Observation> {
             files: vec![FileProvenance {
                 path: format!(
                     "events/{}.jsonl#branch={}",
-                    event.session_id.0.hyphenated(),
+                    event.session_id.as_str(),
                     event.branch_id.as_str()
                 ),
                 sha256: "pending".to_owned(),

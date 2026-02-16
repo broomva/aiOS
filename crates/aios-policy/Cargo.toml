@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-aios-model = { path = "../aios-model" }
+aios-protocol = { path = "../aios-protocol" }
 async-trait.workspace = true
 indexmap.workspace = true
 serde.workspace = true

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use aios_kernel::KernelBuilder;
-use aios_model::{Capability, PolicySet, ToolCall};
+use aios_protocol::{Capability, PolicySet, ToolCall};
 use anyhow::Result;
 use clap::Parser;
 use serde_json::json;
@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
     };
 
     let session = kernel.create_session(cli.owner, policy, None).await?;
-    info!(session_id = %session.session_id.0, workspace = %session.workspace_root, "session created");
+    info!(session_id = %session.session_id, workspace = %session.workspace_root, "session created");
 
     let mut events = kernel.subscribe_events();
     let event_task = tokio::spawn(async move {
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
 
     let write_tick = kernel
         .tick(
-            session.session_id,
+            &session.session_id,
             "Bootstrap workspace with first artifact",
             Some(write_call),
         )
@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
 
     let shell_tick = kernel
         .tick(
-            session.session_id,
+            &session.session_id,
             "Run a bounded shell command",
             Some(shell_call),
         )
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
 
     let read_tick = kernel
         .tick(
-            session.session_id,
+            &session.session_id,
             "Read generated artifact for verification",
             Some(read_call),
         )

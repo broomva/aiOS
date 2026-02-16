@@ -16,7 +16,7 @@ name = "aios-api"
 version = "0.1.0"
 dependencies = [
  "aios-kernel",
- "aios-model",
+ "aios-protocol",
  "anyhow",
  "async-stream",
  "axum",
@@ -35,7 +35,7 @@ dependencies = [
 name = "aios-events"
 version = "0.1.0"
 dependencies = [
- "aios-model",
+ "aios-protocol",
  "anyhow",
  "async-trait",
  "parking_lot",
@@ -51,8 +51,8 @@ version = "0.1.0"
 dependencies = [
  "aios-events",
  "aios-memory",
- "aios-model",
  "aios-policy",
+ "aios-protocol",
  "aios-runtime",
  "aios-sandbox",
  "aios-tools",
@@ -67,7 +67,7 @@ dependencies = [
 name = "aios-memory"
 version = "0.1.0"
 dependencies = [
- "aios-model",
+ "aios-protocol",
  "anyhow",
  "async-trait",
  "serde_json",
@@ -76,7 +76,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "aios-model"
+name = "aios-policy"
+version = "0.1.0"
+dependencies = [
+ "aios-protocol",
+ "async-trait",
+ "indexmap",
+ "serde",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "aios-protocol"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -88,25 +100,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "aios-policy"
-version = "0.1.0"
-dependencies = [
- "aios-model",
- "async-trait",
- "indexmap",
- "serde",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "aios-runtime"
 version = "0.1.0"
 dependencies = [
  "aios-events",
  "aios-memory",
- "aios-model",
  "aios-policy",
+ "aios-protocol",
  "aios-tools",
  "anyhow",
  "chrono",
@@ -124,7 +124,7 @@ dependencies = [
 name = "aios-sandbox"
 version = "0.1.0"
 dependencies = [
- "aios-model",
+ "aios-protocol",
  "anyhow",
  "async-trait",
  "chrono",
@@ -137,8 +137,8 @@ dependencies = [
 name = "aios-tools"
 version = "0.1.0"
 dependencies = [
- "aios-model",
  "aios-policy",
+ "aios-protocol",
  "aios-sandbox",
  "anyhow",
  "async-trait",
@@ -154,7 +154,7 @@ name = "aiosd"
 version = "0.1.0"
 dependencies = [
  "aios-kernel",
- "aios-model",
+ "aios-protocol",
  "anyhow",
  "clap",
  "serde_json",

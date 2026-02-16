@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aios_kernel::{AiosKernel, KernelBuilder};
-use aios_model::{
+use aios_protocol::{
     AgentStateVector, BranchId, BranchInfo, BranchMergeResult, Capability, EventKind, EventRecord,
     ModelRouting, OperatingMode, PolicySet, SessionId, SessionManifest, ToolCall,
 };
@@ -306,8 +306,8 @@ async fn tick_session(
     let result = state
         .kernel
         .tick_on_branch(
-            session_id,
-            branch_id,
+            &session_id,
+            &branch_id,
             request.objective,
             request.proposed_tool.map(|proposed_tool| {
                 ToolCall::new(
@@ -343,7 +343,7 @@ async fn create_branch(
 
     let branch = state
         .kernel
-        .create_branch(session_id, branch_id, from_branch, request.fork_sequence)
+        .create_branch(&session_id, branch_id, from_branch, request.fork_sequence)
         .await
         .map_err(ApiError::internal)?;
 
@@ -357,7 +357,7 @@ async fn list_branches(
     let session_id = parse_session_id(&session_id)?;
     let branches = state
         .kernel
-        .list_branches(session_id)
+        .list_branches(&session_id)
         .await
         .map_err(ApiError::internal)?;
 
@@ -378,7 +378,7 @@ async fn merge_branch(
 
     let result = state
         .kernel
-        .merge_branch(session_id, source_branch, target_branch)
+        .merge_branch(&session_id, source_branch, target_branch)
         .await
         .map_err(ApiError::internal)?;
 
@@ -397,7 +397,7 @@ async fn list_events(
 
     let events = state
         .kernel
-        .read_events_on_branch(session_id, branch_id.clone(), from_sequence, limit)
+        .read_events_on_branch(&session_id, &branch_id, from_sequence, limit)
         .await
         .map_err(ApiError::internal)?;
 
@@ -425,7 +425,7 @@ async fn load_replay_events(
     limit: usize,
 ) -> ApiResult<Vec<EventRecord>> {
     kernel
-        .read_events_on_branch(session_id, branch_id.clone(), from_sequence.max(1), limit)
+        .read_events_on_branch(&session_id, branch_id, from_sequence.max(1), limit)
         .await
         .map_err(ApiError::internal)
 }
@@ -458,14 +458,21 @@ async fn stream_events(
     let replay_limit = replay_window_limit(query.replay_limit);
     let kernel = state.kernel.clone();
 
-    let replay_events =
-        load_replay_events(&kernel, session_id, &branch_id, next_sequence, replay_limit).await?;
+    let replay_events = load_replay_events(
+        &kernel,
+        session_id.clone(),
+        &branch_id,
+        next_sequence,
+        replay_limit,
+    )
+    .await?;
 
     if let Some(last_event) = replay_events.last() {
         next_sequence = last_event.sequence.saturating_add(1);
     }
 
     let mut subscription = kernel.subscribe_events();
+    let session_id_stream = session_id;
     let stream = stream! {
         for event in replay_events {
             yield Ok(as_sse_event("kernel.event", &event));
@@ -475,7 +482,7 @@ async fn stream_events(
         loop {
             match subscription.recv().await {
                 Ok(event) => {
-                    if event.session_id != session_id
+                    if event.session_id != session_id_stream
                         || event.branch_id != branch_id
                         || event.sequence < expected_sequence
                     {
@@ -485,7 +492,7 @@ async fn stream_events(
                     if event.sequence > expected_sequence {
                         match load_gap_events(
                             &kernel,
-                            session_id,
+                            session_id_stream.clone(),
                             &branch_id,
                             expected_sequence,
                             event.sequence,
@@ -538,7 +545,7 @@ async fn stream_events(
                     yield Ok(Event::default().event("stream.lagged").data(lag_payload));
                     match load_replay_events(
                         &kernel,
-                        session_id,
+                        session_id_stream.clone(),
                         &branch_id,
                         expected_sequence,
                         replay_limit,
@@ -590,14 +597,21 @@ async fn stream_events_vercel_ai_sdk_v6(
     let replay_limit = replay_window_limit(query.replay_limit);
     let kernel = state.kernel.clone();
 
-    let replay_events =
-        load_replay_events(&kernel, session_id, &branch_id, next_sequence, replay_limit).await?;
+    let replay_events = load_replay_events(
+        &kernel,
+        session_id.clone(),
+        &branch_id,
+        next_sequence,
+        replay_limit,
+    )
+    .await?;
 
     if let Some(last_event) = replay_events.last() {
         next_sequence = last_event.sequence.saturating_add(1);
     }
 
     let mut subscription = kernel.subscribe_events();
+    let session_id_stream = session_id;
     let stream = stream! {
         for event in replay_events {
             for part in kernel_event_parts(&event) {
@@ -609,7 +623,7 @@ async fn stream_events_vercel_ai_sdk_v6(
         loop {
             match subscription.recv().await {
                 Ok(event) => {
-                    if event.session_id != session_id
+                    if event.session_id != session_id_stream
                         || event.branch_id != branch_id
                         || event.sequence < expected_sequence
                     {
@@ -619,7 +633,7 @@ async fn stream_events_vercel_ai_sdk_v6(
                     if event.sequence > expected_sequence {
                         match load_gap_events(
                             &kernel,
-                            session_id,
+                            session_id_stream.clone(),
                             &branch_id,
                             expected_sequence,
                             event.sequence,
@@ -684,7 +698,7 @@ async fn stream_events_vercel_ai_sdk_v6(
                     yield Ok(Event::default().data(lag_payload));
                     match load_replay_events(
                         &kernel,
-                        session_id,
+                        session_id_stream.clone(),
                         &branch_id,
                         expected_sequence,
                         replay_limit,
@@ -765,9 +779,11 @@ async fn start_voice_session(
         format: format.clone(),
     };
 
+    let session_uuid = Uuid::parse_str(session_id.as_str())
+        .map_err(|e| ApiError::bad_request(format!("invalid session id for voice: {e}")))?;
     let voice_session_id = state
         .voice_adapter
-        .start_session(session_id.0, &config)
+        .start_session(session_uuid, &config)
         .await
         .map_err(ApiError::internal)?;
 
@@ -776,7 +792,7 @@ async fn start_voice_session(
     state.voice_sessions.write().await.insert(
         voice_session_id,
         ActiveVoiceSession {
-            session_id,
+            session_id: session_id.clone(),
             format: format.clone(),
         },
     );
@@ -784,9 +800,9 @@ async fn start_voice_session(
     state
         .kernel
         .record_external_event(
-            session_id,
+            &session_id,
             EventKind::VoiceSessionStarted {
-                voice_session_id,
+                voice_session_id: voice_session_id.to_string(),
                 adapter: contract.command,
                 model: contract.model_id.clone(),
                 sample_rate_hz,
@@ -797,7 +813,7 @@ async fn start_voice_session(
         .map_err(ApiError::internal)?;
 
     Ok(Json(VoiceStartResponse {
-        session_id,
+        session_id: session_id.clone(),
         voice_session_id,
         model: contract.model_id,
         sample_rate_hz,
@@ -805,7 +821,7 @@ async fn start_voice_session(
         format,
         ws_path: format!(
             "/sessions/{}/voice/stream?voice_session_id={voice_session_id}",
-            session_id.0
+            session_id
         ),
     }))
 }
@@ -859,9 +875,9 @@ async fn handle_voice_socket(
                 let _ = state
                     .kernel
                     .record_external_event(
-                        voice_state.session_id,
+                        &voice_state.session_id,
                         EventKind::VoiceInputChunk {
-                            voice_session_id,
+                            voice_session_id: voice_session_id.to_string(),
                             chunk_index: input_chunks,
                             bytes: audio_chunk.len(),
                             format: voice_state.format.clone(),
@@ -879,9 +895,9 @@ async fn handle_voice_socket(
                         let _ = state
                             .kernel
                             .record_external_event(
-                                voice_state.session_id,
+                                &voice_state.session_id,
                                 EventKind::VoiceOutputChunk {
-                                    voice_session_id,
+                                    voice_session_id: voice_session_id.to_string(),
                                     chunk_index: output_chunks,
                                     bytes: output_chunk.len(),
                                     format: voice_state.format.clone(),
@@ -901,9 +917,9 @@ async fn handle_voice_socket(
                         let _ = state
                             .kernel
                             .record_external_event(
-                                voice_state.session_id,
+                                &voice_state.session_id,
                                 EventKind::VoiceAdapterError {
-                                    voice_session_id,
+                                    voice_session_id: voice_session_id.to_string(),
                                     message: error.to_string(),
                                 },
                             )
@@ -928,9 +944,9 @@ async fn handle_voice_socket(
                 let _ = state
                     .kernel
                     .record_external_event(
-                        voice_state.session_id,
+                        &voice_state.session_id,
                         EventKind::VoiceAdapterError {
-                            voice_session_id,
+                            voice_session_id: voice_session_id.to_string(),
                             message: error.to_string(),
                         },
                     )
@@ -944,9 +960,9 @@ async fn handle_voice_socket(
     let _ = state
         .kernel
         .record_external_event(
-            voice_state.session_id,
+            &voice_state.session_id,
             EventKind::VoiceSessionStopped {
-                voice_session_id,
+                voice_session_id: voice_session_id.to_string(),
                 reason: "websocket disconnected".to_owned(),
             },
         )
@@ -966,7 +982,7 @@ async fn resolve_approval(
 
     state
         .kernel
-        .resolve_approval(session_id, approval_id, request.approved, actor)
+        .resolve_approval(&session_id, approval_id, request.approved, actor)
         .await
         .map_err(ApiError::internal)?;
 
@@ -974,9 +990,10 @@ async fn resolve_approval(
 }
 
 fn parse_session_id(raw: &str) -> ApiResult<SessionId> {
-    let uuid = Uuid::parse_str(raw)
+    // Validate UUID format
+    Uuid::parse_str(raw)
         .map_err(|error| ApiError::bad_request(format!("invalid session id: {error}")))?;
-    Ok(SessionId(uuid))
+    Ok(SessionId::from_string(raw))
 }
 
 fn parse_branch_id(raw: Option<&str>) -> ApiResult<BranchId> {
@@ -984,7 +1001,7 @@ fn parse_branch_id(raw: Option<&str>) -> ApiResult<BranchId> {
     if value.is_empty() {
         return Err(ApiError::bad_request("branch must not be empty"));
     }
-    Ok(BranchId::new(value))
+    Ok(BranchId::from_string(value))
 }
 
 fn as_sse_event(event_name: &str, event: &EventRecord) -> Event {
@@ -1036,7 +1053,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use aios_kernel::KernelBuilder;
-    use aios_model::{BranchId, PolicySet};
+    use aios_protocol::{BranchId, PolicySet};
     use axum::Json;
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
@@ -1108,7 +1125,7 @@ mod tests {
             .create_session("api-test", PolicySet::default(), None)
             .await
             .expect("create session");
-        let session_id = session.session_id.0.to_string();
+        let session_id = session.session_id.to_string();
         let feature = "feature-api".to_owned();
 
         let Json(created) = create_branch(
@@ -1150,8 +1167,8 @@ mod tests {
         let tick_error = state
             .kernel
             .tick_on_branch(
-                session.session_id,
-                BranchId::new(feature.clone()),
+                &session.session_id,
+                &BranchId::from_string(feature.clone()),
                 "post-merge tick should fail",
                 None,
             )
@@ -1174,7 +1191,7 @@ mod tests {
             .expect("create session");
 
         let result = create_branch(
-            Path(session.session_id.0.to_string()),
+            Path(session.session_id.to_string()),
             State(state.clone()),
             Json(CreateBranchRequest {
                 branch: "feature-invalid".to_owned(),

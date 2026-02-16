@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aios_model::{Capability, ToolCall, ToolOutcome, ToolRunId};
 use aios_policy::{PolicyEngine, PolicyEvaluation};
+use aios_protocol::{Capability, SessionId, ToolCall, ToolOutcome, ToolRunId};
 use aios_sandbox::{SandboxLimits, SandboxRequest, SandboxRunner};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -121,13 +121,13 @@ impl ToolDispatcher {
 
     pub async fn dispatch(
         &self,
-        session_id: aios_model::SessionId,
+        session_id: SessionId,
         context: &ToolContext,
         call: ToolCall,
     ) -> Result<DispatchResult> {
         let span = tracing::info_span!(
             "tool.dispatch",
-            session_id = %session_id.0,
+            session_id = %session_id,
             tool = %call.tool_name,
             requested_capabilities = call.requested_capabilities.len()
         );
@@ -163,7 +163,7 @@ impl ToolDispatcher {
             });
         }
 
-        let tool_run_id = ToolRunId::new();
+        let tool_run_id = ToolRunId::default();
         let (exit_status, outcome) = match definition.kind {
             ToolKind::FsRead => self.execute_fs_read(context, &call.input).await?,
             ToolKind::FsWrite => self.execute_fs_write(context, &call.input).await?,

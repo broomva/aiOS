@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use aios_events::{EventJournal, EventStreamHub, FileEventStore};
 use aios_memory::WorkspaceMemoryStore;
-use aios_model::{
+use aios_policy::{ApprovalQueue, SessionPolicyEngine};
+use aios_protocol::{
     BranchId, BranchInfo, BranchMergeResult, EventKind, EventRecord, ModelRouting, PolicySet,
     SessionId, SessionManifest, ToolCall,
 };
-use aios_policy::{ApprovalQueue, SessionPolicyEngine};
 use aios_runtime::{KernelRuntime, RuntimeConfig, TickInput, TickOutput};
 use aios_sandbox::LocalSandboxRunner;
 use aios_tools::{ToolDispatcher, ToolRegistry};
@@ -87,25 +87,25 @@ impl AiosKernel {
             .await
     }
 
-    #[instrument(skip(self, objective, proposed_tool), fields(session_id = %session_id.0))]
+    #[instrument(skip(self, objective, proposed_tool), fields(session_id = %session_id))]
     pub async fn tick(
         &self,
-        session_id: SessionId,
+        session_id: &SessionId,
         objective: impl Into<String>,
         proposed_tool: Option<ToolCall>,
     ) -> Result<TickOutput> {
-        self.tick_on_branch(session_id, BranchId::main(), objective, proposed_tool)
+        self.tick_on_branch(session_id, &BranchId::main(), objective, proposed_tool)
             .await
     }
 
     #[instrument(
         skip(self, objective, proposed_tool),
-        fields(session_id = %session_id.0, branch = %branch_id.as_str())
+        fields(session_id = %session_id, branch = %branch_id.as_str())
     )]
     pub async fn tick_on_branch(
         &self,
-        session_id: SessionId,
-        branch_id: BranchId,
+        session_id: &SessionId,
+        branch_id: &BranchId,
         objective: impl Into<String>,
         proposed_tool: Option<ToolCall>,
     ) -> Result<TickOutput> {
@@ -124,14 +124,14 @@ impl AiosKernel {
     #[instrument(
         skip(self),
         fields(
-            session_id = %session_id.0,
+            session_id = %session_id,
             branch = %branch_id.as_str(),
-            from_branch = ?from_branch.as_ref().map(|branch| branch.as_str())
+            from_branch = ?from_branch.as_ref().map(|b: &BranchId| b.as_str())
         )
     )]
     pub async fn create_branch(
         &self,
-        session_id: SessionId,
+        session_id: &SessionId,
         branch_id: BranchId,
         from_branch: Option<BranchId>,
         fork_sequence: Option<u64>,
@@ -141,22 +141,22 @@ impl AiosKernel {
             .await
     }
 
-    #[instrument(skip(self), fields(session_id = %session_id.0))]
-    pub async fn list_branches(&self, session_id: SessionId) -> Result<Vec<BranchInfo>> {
+    #[instrument(skip(self), fields(session_id = %session_id))]
+    pub async fn list_branches(&self, session_id: &SessionId) -> Result<Vec<BranchInfo>> {
         self.runtime.list_branches(session_id).await
     }
 
     #[instrument(
         skip(self),
         fields(
-            session_id = %session_id.0,
+            session_id = %session_id,
             source_branch = %source_branch.as_str(),
             target_branch = %target_branch.as_str()
         )
     )]
     pub async fn merge_branch(
         &self,
-        session_id: SessionId,
+        session_id: &SessionId,
         source_branch: BranchId,
         target_branch: BranchId,
     ) -> Result<BranchMergeResult> {
@@ -167,7 +167,7 @@ impl AiosKernel {
 
     pub async fn resolve_approval(
         &self,
-        session_id: SessionId,
+        session_id: &SessionId,
         approval_id: uuid::Uuid,
         approved: bool,
         actor: impl Into<String>,
@@ -183,17 +183,17 @@ impl AiosKernel {
 
     pub async fn record_external_event(
         &self,
-        session_id: SessionId,
+        session_id: &SessionId,
         kind: EventKind,
     ) -> Result<()> {
-        self.record_external_event_on_branch(session_id, BranchId::main(), kind)
+        self.record_external_event_on_branch(session_id, &BranchId::main(), kind)
             .await
     }
 
     pub async fn record_external_event_on_branch(
         &self,
-        session_id: SessionId,
-        branch_id: BranchId,
+        session_id: &SessionId,
+        branch_id: &BranchId,
         kind: EventKind,
     ) -> Result<()> {
         self.runtime
@@ -203,18 +203,18 @@ impl AiosKernel {
 
     pub async fn read_events(
         &self,
-        session_id: SessionId,
+        session_id: &SessionId,
         from_sequence: u64,
         limit: usize,
     ) -> Result<Vec<EventRecord>> {
-        self.read_events_on_branch(session_id, BranchId::main(), from_sequence, limit)
+        self.read_events_on_branch(session_id, &BranchId::main(), from_sequence, limit)
             .await
     }
 
     pub async fn read_events_on_branch(
         &self,
-        session_id: SessionId,
-        branch_id: BranchId,
+        session_id: &SessionId,
+        branch_id: &BranchId,
         from_sequence: u64,
         limit: usize,
     ) -> Result<Vec<EventRecord>> {
@@ -229,7 +229,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use aios_model::{BranchId, Capability, OperatingMode, PolicySet, ToolCall};
+    use aios_protocol::{BranchId, Capability, OperatingMode, PolicySet, ToolCall};
     use anyhow::Result;
     use serde_json::json;
     use tokio::fs;
@@ -273,7 +273,7 @@ mod tests {
         );
 
         let tick = kernel
-            .tick(session.session_id, "write test artifact", Some(call))
+            .tick(&session.session_id, "write test artifact", Some(call))
             .await?;
         assert!(tick.state.progress > 0.0);
         assert!(matches!(
@@ -316,7 +316,7 @@ mod tests {
 
         let tick = kernel
             .tick(
-                session.session_id,
+                &session.session_id,
                 "attempt forbidden command",
                 Some(forbidden),
             )
@@ -338,10 +338,10 @@ mod tests {
             .create_session("tester", PolicySet::default(), None)
             .await?;
 
-        let feature = BranchId::new("feature-a");
+        let feature = BranchId::from_string("feature-a");
         let created = kernel
             .create_branch(
-                session.session_id,
+                &session.session_id,
                 feature.clone(),
                 Some(BranchId::main()),
                 None,
@@ -349,17 +349,17 @@ mod tests {
             .await?;
         assert_eq!(created.branch_id, feature);
         let _ = kernel
-            .tick_on_branch(session.session_id, BranchId::main(), "main tick", None)
+            .tick_on_branch(&session.session_id, &BranchId::main(), "main tick", None)
             .await?;
         let _ = kernel
-            .tick_on_branch(session.session_id, feature.clone(), "feature tick", None)
+            .tick_on_branch(&session.session_id, &feature, "feature tick", None)
             .await?;
 
         let main_events = kernel
-            .read_events_on_branch(session.session_id, BranchId::main(), 1, 256)
+            .read_events_on_branch(&session.session_id, &BranchId::main(), 1, 256)
             .await?;
         let feature_events = kernel
-            .read_events_on_branch(session.session_id, feature.clone(), 1, 256)
+            .read_events_on_branch(&session.session_id, &feature, 1, 256)
             .await?;
 
         assert!(!main_events.is_empty());
@@ -383,10 +383,10 @@ mod tests {
             .create_session("tester", PolicySet::default(), None)
             .await?;
 
-        let feature = BranchId::new("feature-replay");
+        let feature = BranchId::from_string("feature-replay");
         kernel
             .create_branch(
-                session.session_id,
+                &session.session_id,
                 feature.clone(),
                 Some(BranchId::main()),
                 None,
@@ -394,28 +394,28 @@ mod tests {
             .await?;
 
         let _ = kernel
-            .tick_on_branch(session.session_id, BranchId::main(), "main tick 1", None)
+            .tick_on_branch(&session.session_id, &BranchId::main(), "main tick 1", None)
             .await?;
         let main_snapshot = kernel
-            .read_events_on_branch(session.session_id, BranchId::main(), 1, 512)
+            .read_events_on_branch(&session.session_id, &BranchId::main(), 1, 512)
             .await?;
         let main_snapshot_json = serde_json::to_string(&main_snapshot)?;
 
         let _ = kernel
-            .tick_on_branch(session.session_id, feature.clone(), "feature tick 1", None)
+            .tick_on_branch(&session.session_id, &feature, "feature tick 1", None)
             .await?;
 
         let main_after_feature = kernel
-            .read_events_on_branch(session.session_id, BranchId::main(), 1, 512)
+            .read_events_on_branch(&session.session_id, &BranchId::main(), 1, 512)
             .await?;
         let main_after_feature_json = serde_json::to_string(&main_after_feature)?;
         assert_eq!(main_snapshot_json, main_after_feature_json);
 
         let feature_events_first = kernel
-            .read_events_on_branch(session.session_id, feature.clone(), 1, 512)
+            .read_events_on_branch(&session.session_id, &feature, 1, 512)
             .await?;
         let feature_events_second = kernel
-            .read_events_on_branch(session.session_id, feature.clone(), 1, 512)
+            .read_events_on_branch(&session.session_id, &feature, 1, 512)
             .await?;
         assert_eq!(
             serde_json::to_string(&feature_events_first)?,
@@ -434,10 +434,10 @@ mod tests {
             .create_session("tester", PolicySet::default(), None)
             .await?;
 
-        let feature = BranchId::new("feature-merge");
+        let feature = BranchId::from_string("feature-merge");
         kernel
             .create_branch(
-                session.session_id,
+                &session.session_id,
                 feature.clone(),
                 Some(BranchId::main()),
                 None,
@@ -445,15 +445,15 @@ mod tests {
             .await?;
 
         let _ = kernel
-            .tick_on_branch(session.session_id, feature.clone(), "feature tick 1", None)
+            .tick_on_branch(&session.session_id, &feature, "feature tick 1", None)
             .await?;
 
         let merge = kernel
-            .merge_branch(session.session_id, feature.clone(), BranchId::main())
+            .merge_branch(&session.session_id, feature.clone(), BranchId::main())
             .await?;
         assert_eq!(merge.source_branch, feature);
 
-        let branches = kernel.list_branches(session.session_id).await?;
+        let branches = kernel.list_branches(&session.session_id).await?;
         let feature_info = branches
             .iter()
             .find(|branch| branch.branch_id == feature)
@@ -461,26 +461,21 @@ mod tests {
         assert_eq!(feature_info.merged_into, Some(BranchId::main()));
 
         let second_merge_error = kernel
-            .merge_branch(session.session_id, feature.clone(), BranchId::main())
+            .merge_branch(&session.session_id, feature.clone(), BranchId::main())
             .await
             .expect_err("branch should not merge twice");
         assert!(second_merge_error.to_string().contains("already merged"));
 
         let tick_error = kernel
-            .tick_on_branch(
-                session.session_id,
-                feature.clone(),
-                "tick after merge",
-                None,
-            )
+            .tick_on_branch(&session.session_id, &feature, "tick after merge", None)
             .await
             .expect_err("merged branch should be read-only");
         assert!(tick_error.to_string().contains("read-only"));
 
         let _ = kernel
             .tick_on_branch(
-                session.session_id,
-                BranchId::main(),
+                &session.session_id,
+                &BranchId::main(),
                 "main still writable",
                 None,
             )
@@ -498,10 +493,10 @@ mod tests {
             .create_session("tester", PolicySet::default(), None)
             .await?;
 
-        let feature = BranchId::new("feature-invalid-fork");
+        let feature = BranchId::from_string("feature-invalid-fork");
         let error = kernel
             .create_branch(
-                session.session_id,
+                &session.session_id,
                 feature,
                 Some(BranchId::main()),
                 Some(1_000),
@@ -522,10 +517,10 @@ mod tests {
             .create_session("tester", PolicySet::default(), None)
             .await?;
 
-        let feature = BranchId::new("feature-main-merge");
+        let feature = BranchId::from_string("feature-main-merge");
         kernel
             .create_branch(
-                session.session_id,
+                &session.session_id,
                 feature.clone(),
                 Some(BranchId::main()),
                 None,
@@ -533,7 +528,7 @@ mod tests {
             .await?;
 
         let error = kernel
-            .merge_branch(session.session_id, BranchId::main(), feature)
+            .merge_branch(&session.session_id, BranchId::main(), feature)
             .await
             .expect_err("main should not be a merge source");
         assert!(

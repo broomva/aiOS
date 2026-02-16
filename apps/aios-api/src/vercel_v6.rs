@@ -1,4 +1,4 @@
-use aios_model::EventRecord;
+use aios_protocol::EventRecord;
 use axum::response::sse::Event;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -32,7 +32,7 @@ pub enum VercelAiSdkV6Part {
 }
 
 pub fn kernel_event_parts(event: &EventRecord) -> [VercelAiSdkV6Part; 5] {
-    let message_id = format!("kernel-event-{}", event.event_id.0.hyphenated());
+    let message_id = format!("kernel-event-{}", event.event_id);
     let payload = serde_json::to_value(event).unwrap_or_else(|error| {
         json!({
             "error": error.to_string(),
@@ -73,9 +73,8 @@ pub fn part_as_sse_event(part: &VercelAiSdkV6Part) -> Event {
 
 #[cfg(test)]
 mod tests {
-    use aios_model::{BranchId, EventKind, EventRecord, SessionId};
+    use aios_protocol::{BranchId, EventKind, EventRecord, SessionId};
     use serde_json::{Value, json};
-    use uuid::Uuid;
 
     use super::{VercelAiSdkV6Part, kernel_event_parts};
 
@@ -96,7 +95,7 @@ mod tests {
 
     #[test]
     fn kernel_event_maps_to_custom_data_part() {
-        let session_id = SessionId(Uuid::nil());
+        let session_id = SessionId::from_string("00000000-0000-0000-0000-000000000000");
         let event = EventRecord::new(
             session_id,
             BranchId::main(),

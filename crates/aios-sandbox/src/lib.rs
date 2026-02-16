@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use aios_model::Capability;
+use aios_protocol::Capability;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
