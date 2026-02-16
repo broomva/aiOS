@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use aios_kernel::{AiosKernel, KernelBuilder};
 use aios_model::{
-    AgentStateVector, Capability, EventKind, EventRecord, ModelRouting, OperatingMode, PolicySet,
-    SessionId, SessionManifest, ToolCall,
+    AgentStateVector, BranchId, BranchInfo, BranchMergeResult, Capability, EventKind, EventRecord,
+    ModelRouting, OperatingMode, PolicySet, SessionId, SessionManifest, ToolCall,
 };
 use anyhow::Result;
 use async_stream::stream;
@@ -75,7 +75,15 @@ struct CreateSessionRequest {
 #[derive(Debug, Deserialize)]
 struct TickRequest {
     objective: String,
+    branch: Option<String>,
     proposed_tool: Option<ProposedToolRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateBranchRequest {
+    branch: String,
+    from_branch: Option<String>,
+    fork_sequence: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +111,7 @@ struct ResolveApprovalRequest {
 
 #[derive(Debug, Deserialize, Default)]
 struct EventListQuery {
+    branch: Option<String>,
     from_sequence: Option<u64>,
     limit: Option<usize>,
 }
@@ -110,12 +119,31 @@ struct EventListQuery {
 #[derive(Debug, Serialize)]
 struct EventListResponse {
     session_id: SessionId,
+    branch: BranchId,
     from_sequence: u64,
     events: Vec<EventRecord>,
 }
 
+#[derive(Debug, Serialize)]
+struct BranchListResponse {
+    session_id: SessionId,
+    branches: Vec<BranchInfo>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct MergeBranchRequest {
+    target_branch: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BranchMergeResponse {
+    session_id: SessionId,
+    result: BranchMergeResult,
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct EventStreamQuery {
+    branch: Option<String>,
     cursor: Option<u64>,
     replay_limit: Option<usize>,
 }
@@ -199,6 +227,14 @@ async fn main() -> Result<()> {
         .route("/docs/", get(docs))
         .route("/sessions", post(create_session))
         .route("/sessions/{session_id}/ticks", post(tick_session))
+        .route(
+            "/sessions/{session_id}/branches",
+            post(create_branch).get(list_branches),
+        )
+        .route(
+            "/sessions/{session_id}/branches/{branch_id}/merge",
+            post(merge_branch),
+        )
         .route("/sessions/{session_id}/events", get(list_events))
         .route("/sessions/{session_id}/events/stream", get(stream_events))
         .route(
@@ -265,11 +301,13 @@ async fn tick_session(
     Json(request): Json<TickRequest>,
 ) -> ApiResult<Json<TickResponse>> {
     let session_id = parse_session_id(&session_id)?;
+    let branch_id = parse_branch_id(request.branch.as_deref())?;
 
     let result = state
         .kernel
-        .tick(
+        .tick_on_branch(
             session_id,
+            branch_id,
             request.objective,
             request.proposed_tool.map(|proposed_tool| {
                 ToolCall::new(
@@ -291,26 +329,122 @@ async fn tick_session(
     }))
 }
 
+async fn create_branch(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<CreateBranchRequest>,
+) -> ApiResult<Json<BranchInfo>> {
+    let session_id = parse_session_id(&session_id)?;
+    let branch_id = parse_branch_id(Some(&request.branch))?;
+    let from_branch = match request.from_branch.as_deref() {
+        Some(raw) => Some(parse_branch_id(Some(raw))?),
+        None => None,
+    };
+
+    let branch = state
+        .kernel
+        .create_branch(session_id, branch_id, from_branch, request.fork_sequence)
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(branch))
+}
+
+async fn list_branches(
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+) -> ApiResult<Json<BranchListResponse>> {
+    let session_id = parse_session_id(&session_id)?;
+    let branches = state
+        .kernel
+        .list_branches(session_id)
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(BranchListResponse {
+        session_id,
+        branches,
+    }))
+}
+
+async fn merge_branch(
+    Path((session_id, branch_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<MergeBranchRequest>,
+) -> ApiResult<Json<BranchMergeResponse>> {
+    let session_id = parse_session_id(&session_id)?;
+    let source_branch = parse_branch_id(Some(&branch_id))?;
+    let target_branch = parse_branch_id(request.target_branch.as_deref())?;
+
+    let result = state
+        .kernel
+        .merge_branch(session_id, source_branch, target_branch)
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(BranchMergeResponse { session_id, result }))
+}
+
 async fn list_events(
     Path(session_id): Path<String>,
     Query(query): Query<EventListQuery>,
     State(state): State<AppState>,
 ) -> ApiResult<Json<EventListResponse>> {
     let session_id = parse_session_id(&session_id)?;
+    let branch_id = parse_branch_id(query.branch.as_deref())?;
     let from_sequence = query.from_sequence.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(200).clamp(1, 5000);
 
     let events = state
         .kernel
-        .read_events(session_id, from_sequence, limit)
+        .read_events_on_branch(session_id, branch_id.clone(), from_sequence, limit)
         .await
         .map_err(ApiError::internal)?;
 
     Ok(Json(EventListResponse {
         session_id,
+        branch: branch_id,
         from_sequence,
         events,
     }))
+}
+
+fn replay_start_sequence(cursor: Option<u64>) -> u64 {
+    cursor.map_or(1, |value| value.saturating_add(1))
+}
+
+fn replay_window_limit(replay_limit: Option<usize>) -> usize {
+    replay_limit.unwrap_or(500).clamp(1, 5000)
+}
+
+async fn load_replay_events(
+    kernel: &AiosKernel,
+    session_id: SessionId,
+    branch_id: &BranchId,
+    from_sequence: u64,
+    limit: usize,
+) -> ApiResult<Vec<EventRecord>> {
+    kernel
+        .read_events_on_branch(session_id, branch_id.clone(), from_sequence.max(1), limit)
+        .await
+        .map_err(ApiError::internal)
+}
+
+async fn load_gap_events(
+    kernel: &AiosKernel,
+    session_id: SessionId,
+    branch_id: &BranchId,
+    from_sequence: u64,
+    through_sequence: u64,
+    limit: usize,
+) -> ApiResult<Vec<EventRecord>> {
+    if from_sequence > through_sequence {
+        return Ok(Vec::new());
+    }
+    let mut events =
+        load_replay_events(kernel, session_id, branch_id, from_sequence, limit).await?;
+    events.retain(|event| event.sequence <= through_sequence);
+    Ok(events)
 }
 
 async fn stream_events(
@@ -319,20 +453,19 @@ async fn stream_events(
     State(state): State<AppState>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let session_id = parse_session_id(&session_id)?;
-    let mut next_sequence = query.cursor.map_or(1, |cursor| cursor.saturating_add(1));
-    let replay_limit = query.replay_limit.unwrap_or(500).clamp(1, 5000);
+    let branch_id = parse_branch_id(query.branch.as_deref())?;
+    let mut next_sequence = replay_start_sequence(query.cursor);
+    let replay_limit = replay_window_limit(query.replay_limit);
+    let kernel = state.kernel.clone();
 
-    let replay_events = state
-        .kernel
-        .read_events(session_id, next_sequence, replay_limit)
-        .await
-        .map_err(ApiError::internal)?;
+    let replay_events =
+        load_replay_events(&kernel, session_id, &branch_id, next_sequence, replay_limit).await?;
 
     if let Some(last_event) = replay_events.last() {
         next_sequence = last_event.sequence.saturating_add(1);
     }
 
-    let mut subscription = state.kernel.subscribe_events();
+    let mut subscription = kernel.subscribe_events();
     let stream = stream! {
         for event in replay_events {
             yield Ok(as_sse_event("kernel.event", &event));
@@ -342,15 +475,94 @@ async fn stream_events(
         loop {
             match subscription.recv().await {
                 Ok(event) => {
-                    if event.session_id != session_id || event.sequence < expected_sequence {
+                    if event.session_id != session_id
+                        || event.branch_id != branch_id
+                        || event.sequence < expected_sequence
+                    {
                         continue;
                     }
+
+                    if event.sequence > expected_sequence {
+                        match load_gap_events(
+                            &kernel,
+                            session_id,
+                            &branch_id,
+                            expected_sequence,
+                            event.sequence,
+                            replay_limit,
+                        )
+                        .await
+                        {
+                            Ok(backfill_events) => {
+                                let mut replayed_current = false;
+                                for backfill_event in backfill_events {
+                                    if backfill_event.sequence < expected_sequence {
+                                        continue;
+                                    }
+                                    if backfill_event.sequence == event.sequence {
+                                        replayed_current = true;
+                                    }
+                                    expected_sequence = backfill_event.sequence.saturating_add(1);
+                                    yield Ok(as_sse_event("kernel.event", &backfill_event));
+                                }
+                                if replayed_current {
+                                    continue;
+                                }
+                            }
+                            Err(error) => {
+                                let payload = json!({
+                                    "error": error.message,
+                                    "from_sequence": expected_sequence,
+                                    "through_sequence": event.sequence,
+                                })
+                                .to_string();
+                                yield Ok(Event::default().event("stream.error").data(payload));
+                                continue;
+                            }
+                        }
+                    }
+
+                    if event.sequence != expected_sequence {
+                        continue;
+                    }
+
                     expected_sequence = event.sequence.saturating_add(1);
                     yield Ok(as_sse_event("kernel.event", &event));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    let lag_payload = json!({ "skipped": skipped }).to_string();
+                    let lag_payload = json!({
+                        "skipped": skipped,
+                        "from_sequence": expected_sequence,
+                    })
+                    .to_string();
                     yield Ok(Event::default().event("stream.lagged").data(lag_payload));
+                    match load_replay_events(
+                        &kernel,
+                        session_id,
+                        &branch_id,
+                        expected_sequence,
+                        replay_limit,
+                    )
+                    .await
+                    {
+                        Ok(backfill_events) => {
+                            for backfill_event in backfill_events {
+                                if backfill_event.sequence < expected_sequence {
+                                    continue;
+                                }
+                                expected_sequence = backfill_event.sequence.saturating_add(1);
+                                yield Ok(as_sse_event("kernel.event", &backfill_event));
+                            }
+                        }
+                        Err(error) => {
+                            let payload = json!({
+                                "error": error.message,
+                                "from_sequence": expected_sequence,
+                            })
+                            .to_string();
+                            yield Ok(Event::default().event("stream.error").data(payload));
+                        }
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -373,20 +585,19 @@ async fn stream_events_vercel_ai_sdk_v6(
     Sse<impl Stream<Item = Result<Event, Infallible>>>,
 )> {
     let session_id = parse_session_id(&session_id)?;
-    let mut next_sequence = query.cursor.map_or(1, |cursor| cursor.saturating_add(1));
-    let replay_limit = query.replay_limit.unwrap_or(500).clamp(1, 5000);
+    let branch_id = parse_branch_id(query.branch.as_deref())?;
+    let mut next_sequence = replay_start_sequence(query.cursor);
+    let replay_limit = replay_window_limit(query.replay_limit);
+    let kernel = state.kernel.clone();
 
-    let replay_events = state
-        .kernel
-        .read_events(session_id, next_sequence, replay_limit)
-        .await
-        .map_err(ApiError::internal)?;
+    let replay_events =
+        load_replay_events(&kernel, session_id, &branch_id, next_sequence, replay_limit).await?;
 
     if let Some(last_event) = replay_events.last() {
         next_sequence = last_event.sequence.saturating_add(1);
     }
 
-    let mut subscription = state.kernel.subscribe_events();
+    let mut subscription = kernel.subscribe_events();
     let stream = stream! {
         for event in replay_events {
             for part in kernel_event_parts(&event) {
@@ -398,7 +609,60 @@ async fn stream_events_vercel_ai_sdk_v6(
         loop {
             match subscription.recv().await {
                 Ok(event) => {
-                    if event.session_id != session_id || event.sequence < expected_sequence {
+                    if event.session_id != session_id
+                        || event.branch_id != branch_id
+                        || event.sequence < expected_sequence
+                    {
+                        continue;
+                    }
+
+                    if event.sequence > expected_sequence {
+                        match load_gap_events(
+                            &kernel,
+                            session_id,
+                            &branch_id,
+                            expected_sequence,
+                            event.sequence,
+                            replay_limit,
+                        )
+                        .await
+                        {
+                            Ok(backfill_events) => {
+                                let mut replayed_current = false;
+                                for backfill_event in backfill_events {
+                                    if backfill_event.sequence < expected_sequence {
+                                        continue;
+                                    }
+                                    if backfill_event.sequence == event.sequence {
+                                        replayed_current = true;
+                                    }
+                                    expected_sequence = backfill_event.sequence.saturating_add(1);
+                                    for part in kernel_event_parts(&backfill_event) {
+                                        yield Ok(part_as_sse_event(&part));
+                                    }
+                                }
+                                if replayed_current {
+                                    continue;
+                                }
+                            }
+                            Err(error) => {
+                                let payload = json!({
+                                    "type": "data-aios-stream-status",
+                                    "data": {
+                                        "status": "error",
+                                        "message": error.message,
+                                        "from_sequence": expected_sequence,
+                                        "through_sequence": event.sequence,
+                                    },
+                                })
+                                .to_string();
+                                yield Ok(Event::default().data(payload));
+                                continue;
+                            }
+                        }
+                    }
+
+                    if event.sequence != expected_sequence {
                         continue;
                     }
 
@@ -413,10 +677,44 @@ async fn stream_events_vercel_ai_sdk_v6(
                         "data": {
                             "status": "lagged",
                             "skipped": skipped,
+                            "from_sequence": expected_sequence,
                         },
                     })
                     .to_string();
                     yield Ok(Event::default().data(lag_payload));
+                    match load_replay_events(
+                        &kernel,
+                        session_id,
+                        &branch_id,
+                        expected_sequence,
+                        replay_limit,
+                    )
+                    .await
+                    {
+                        Ok(backfill_events) => {
+                            for backfill_event in backfill_events {
+                                if backfill_event.sequence < expected_sequence {
+                                    continue;
+                                }
+                                expected_sequence = backfill_event.sequence.saturating_add(1);
+                                for part in kernel_event_parts(&backfill_event) {
+                                    yield Ok(part_as_sse_event(&part));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let payload = json!({
+                                "type": "data-aios-stream-status",
+                                "data": {
+                                    "status": "error",
+                                    "message": error.message,
+                                    "from_sequence": expected_sequence,
+                                },
+                            })
+                            .to_string();
+                            yield Ok(Event::default().data(payload));
+                        }
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     yield Ok(Event::default().data("[DONE]"));
@@ -681,6 +979,14 @@ fn parse_session_id(raw: &str) -> ApiResult<SessionId> {
     Ok(SessionId(uuid))
 }
 
+fn parse_branch_id(raw: Option<&str>) -> ApiResult<BranchId> {
+    let value = raw.unwrap_or("main").trim();
+    if value.is_empty() {
+        return Err(ApiError::bad_request("branch must not be empty"));
+    }
+    Ok(BranchId::new(value))
+}
+
 fn as_sse_event(event_name: &str, event: &EventRecord) -> Event {
     let payload = serde_json::to_string(event)
         .unwrap_or_else(|error| json!({ "error": error.to_string() }).to_string());
@@ -724,11 +1030,164 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_session_id;
+    use std::collections::HashMap;
+    use std::path::{Path as StdPath, PathBuf};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use aios_kernel::KernelBuilder;
+    use aios_model::{BranchId, PolicySet};
+    use axum::Json;
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use tokio::fs;
+    use tokio::sync::RwLock;
+
+    use super::{
+        AppState, CreateBranchRequest, MergeBranchRequest, PersonaplexProcessContract,
+        StubPersonaplexAdapter, create_branch, list_branches, merge_branch, parse_branch_id,
+        parse_session_id, replay_start_sequence, replay_window_limit,
+    };
+
+    fn unique_test_root(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("{name}-{nanos}"))
+    }
+
+    fn test_state(root: &StdPath) -> AppState {
+        AppState {
+            kernel: KernelBuilder::new(root).build(),
+            voice_adapter: StubPersonaplexAdapter::new(PersonaplexProcessContract::default()),
+            voice_sessions: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
 
     #[test]
     fn parse_session_id_rejects_invalid_uuid() {
         let result = parse_session_id("not-a-uuid");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_branch_id_defaults_to_main() {
+        let branch = parse_branch_id(None).expect("default branch");
+        assert_eq!(branch.as_str(), "main");
+    }
+
+    #[test]
+    fn parse_branch_id_rejects_empty_string() {
+        let result = parse_branch_id(Some(" "));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn replay_start_sequence_uses_next_after_cursor() {
+        assert_eq!(replay_start_sequence(None), 1);
+        assert_eq!(replay_start_sequence(Some(0)), 1);
+        assert_eq!(replay_start_sequence(Some(41)), 42);
+    }
+
+    #[test]
+    fn replay_window_limit_is_bounded() {
+        assert_eq!(replay_window_limit(None), 500);
+        assert_eq!(replay_window_limit(Some(0)), 1);
+        assert_eq!(replay_window_limit(Some(12)), 12);
+        assert_eq!(replay_window_limit(Some(20_000)), 5_000);
+    }
+
+    #[tokio::test]
+    async fn branch_handlers_create_list_merge_round_trip() {
+        let root = unique_test_root("aios-api-branches");
+        let state = test_state(&root);
+
+        let session = state
+            .kernel
+            .create_session("api-test", PolicySet::default(), None)
+            .await
+            .expect("create session");
+        let session_id = session.session_id.0.to_string();
+        let feature = "feature-api".to_owned();
+
+        let Json(created) = create_branch(
+            Path(session_id.clone()),
+            State(state.clone()),
+            Json(CreateBranchRequest {
+                branch: feature.clone(),
+                from_branch: Some("main".to_owned()),
+                fork_sequence: None,
+            }),
+        )
+        .await
+        .expect("create branch");
+        assert_eq!(created.branch_id.as_str(), feature.as_str());
+
+        let Json(listing) = list_branches(Path(session_id.clone()), State(state.clone()))
+            .await
+            .expect("list branches");
+        assert_eq!(listing.session_id, session.session_id);
+        assert!(
+            listing
+                .branches
+                .iter()
+                .any(|branch| branch.branch_id.as_str() == feature.as_str())
+        );
+
+        let Json(merge) = merge_branch(
+            Path((session_id, feature.clone())),
+            State(state.clone()),
+            Json(MergeBranchRequest {
+                target_branch: Some("main".to_owned()),
+            }),
+        )
+        .await
+        .expect("merge branch");
+        assert_eq!(merge.result.source_branch.as_str(), feature.as_str());
+        assert_eq!(merge.result.target_branch.as_str(), "main");
+
+        let tick_error = state
+            .kernel
+            .tick_on_branch(
+                session.session_id,
+                BranchId::new(feature.clone()),
+                "post-merge tick should fail",
+                None,
+            )
+            .await
+            .expect_err("merged branch should be read-only");
+        assert!(tick_error.to_string().contains("read-only"));
+
+        let _ = fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn create_branch_handler_returns_error_for_invalid_fork_sequence() {
+        let root = unique_test_root("aios-api-branch-errors");
+        let state = test_state(&root);
+
+        let session = state
+            .kernel
+            .create_session("api-test", PolicySet::default(), None)
+            .await
+            .expect("create session");
+
+        let result = create_branch(
+            Path(session.session_id.0.to_string()),
+            State(state.clone()),
+            Json(CreateBranchRequest {
+                branch: "feature-invalid".to_owned(),
+                from_branch: Some("main".to_owned()),
+                fork_sequence: Some(1_000),
+            }),
+        )
+        .await;
+
+        let error = result.expect_err("fork sequence beyond head should fail");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(error.message.contains("exceeds source branch head"));
+
+        let _ = fs::remove_dir_all(root).await;
     }
 }

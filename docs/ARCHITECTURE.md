@@ -129,3 +129,19 @@ The event model now also includes first-slice voice events:
 - `voice_output_chunk`
 - `voice_session_stopped`
 - `voice_adapter_error`
+
+## Branch Lifecycle Semantics
+
+- Every branch has an independent monotonic event sequence.
+- `create_branch` validates that `fork_sequence` does not exceed the source branch head.
+- `merge_branch` only allows non-`main` source branches and emits a merge event on the target branch.
+- Once a branch is merged, it is marked read-only (`merged_into`) and cannot emit new events.
+
+## Observability Boundaries
+
+`tracing` spans are expected at:
+- kernel API entry points
+- runtime session/tick/branch operations
+- tool dispatch and execution handlers
+- sandbox command execution
+- event-store append/read/sequence paths

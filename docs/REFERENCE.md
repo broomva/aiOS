@@ -23,6 +23,9 @@ cargo run -p aios-api -- --root .aios --listen 127.0.0.1:8787
 - `GET /docs`
 - `POST /sessions`
 - `POST /sessions/{session_id}/ticks`
+- `POST /sessions/{session_id}/branches`
+- `GET /sessions/{session_id}/branches`
+- `POST /sessions/{session_id}/branches/{branch_id}/merge`
 - `POST /sessions/{session_id}/approvals/{approval_id}`
 - `GET /sessions/{session_id}/events?from_sequence=1&limit=200`
 - `GET /sessions/{session_id}/events/stream?cursor=0&replay_limit=500`

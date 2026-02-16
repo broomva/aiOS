@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::fs;
+use tracing::{debug, instrument, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ToolKind {
@@ -124,6 +125,14 @@ impl ToolDispatcher {
         context: &ToolContext,
         call: ToolCall,
     ) -> Result<DispatchResult> {
+        let span = tracing::info_span!(
+            "tool.dispatch",
+            session_id = %session_id.0,
+            tool = %call.tool_name,
+            requested_capabilities = call.requested_capabilities.len()
+        );
+        let _enter = span.enter();
+
         let definition = self
             .registry
             .get(&call.tool_name)
@@ -139,10 +148,15 @@ impl ToolDispatcher {
             .await;
 
         if !evaluation.denied.is_empty() {
+            warn!(denied = evaluation.denied.len(), "tool capabilities denied");
             bail!("capabilities denied for tool {}", definition.name);
         }
 
         if !evaluation.requires_approval.is_empty() {
+            debug!(
+                approvals_required = evaluation.requires_approval.len(),
+                "tool execution requires approval"
+            );
             return Ok(DispatchResult::NeedsApproval {
                 tool_name: definition.name,
                 evaluation,
@@ -155,6 +169,7 @@ impl ToolDispatcher {
             ToolKind::FsWrite => self.execute_fs_write(context, &call.input).await?,
             ToolKind::ShellExec => self.execute_shell_exec(context, &call).await?,
         };
+        debug!(exit_status, "tool execution finished");
 
         Ok(DispatchResult::Executed(ToolExecutionReport {
             tool_run_id,
@@ -165,6 +180,7 @@ impl ToolDispatcher {
         }))
     }
 
+    #[instrument(skip(self, context, input), fields(tool = "fs.read"))]
     async fn execute_fs_read(
         &self,
         context: &ToolContext,
@@ -186,6 +202,7 @@ impl ToolDispatcher {
         ))
     }
 
+    #[instrument(skip(self, context, input), fields(tool = "fs.write"))]
     async fn execute_fs_write(
         &self,
         context: &ToolContext,
@@ -214,6 +231,7 @@ impl ToolDispatcher {
         ))
     }
 
+    #[instrument(skip(self, context, call), fields(tool = "shell.exec"))]
     async fn execute_shell_exec(
         &self,
         context: &ToolContext,

@@ -80,6 +80,75 @@ pub fn openapi_spec() -> Value {
                     },
                 },
             },
+            "/sessions/{session_id}/branches": {
+                "post": {
+                    "summary": "Create branch",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/SessionIdPath" },
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/CreateBranchRequest" },
+                            },
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Branch info",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/BranchInfo" },
+                                },
+                            },
+                        },
+                    },
+                },
+                "get": {
+                    "summary": "List branches for session",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/SessionIdPath" },
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Branch list",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/BranchListResponse" },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            "/sessions/{session_id}/branches/{branch_id}/merge": {
+                "post": {
+                    "summary": "Merge source branch into target branch",
+                    "parameters": [
+                        { "$ref": "#/components/parameters/SessionIdPath" },
+                        { "$ref": "#/components/parameters/BranchPath" },
+                    ],
+                    "requestBody": {
+                        "required": false,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/MergeBranchRequest" },
+                            },
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Merge result",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/BranchMergeResponse" },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
             "/sessions/{session_id}/approvals/{approval_id}": {
                 "post": {
                     "summary": "Resolve approval gate",
@@ -105,6 +174,12 @@ pub fn openapi_spec() -> Value {
                     "summary": "List persisted events",
                     "parameters": [
                         { "$ref": "#/components/parameters/SessionIdPath" },
+                        {
+                            "name": "branch",
+                            "in": "query",
+                            "required": false,
+                            "schema": { "type": "string", "default": "main" },
+                        },
                         {
                             "name": "from_sequence",
                             "in": "query",
@@ -135,6 +210,7 @@ pub fn openapi_spec() -> Value {
                     "summary": "Stream raw kernel events over SSE",
                     "parameters": [
                         { "$ref": "#/components/parameters/SessionIdPath" },
+                        { "$ref": "#/components/parameters/BranchQuery" },
                         { "$ref": "#/components/parameters/CursorQuery" },
                         { "$ref": "#/components/parameters/ReplayLimitQuery" },
                     ],
@@ -155,6 +231,7 @@ pub fn openapi_spec() -> Value {
                     "summary": "Stream Vercel AI SDK v6 UIMessage protocol over SSE",
                     "parameters": [
                         { "$ref": "#/components/parameters/SessionIdPath" },
+                        { "$ref": "#/components/parameters/BranchQuery" },
                         { "$ref": "#/components/parameters/CursorQuery" },
                         { "$ref": "#/components/parameters/ReplayLimitQuery" },
                     ],
@@ -264,11 +341,23 @@ pub fn openapi_spec() -> Value {
                     "required": true,
                     "schema": { "type": "string", "format": "uuid" },
                 },
+                "BranchPath": {
+                    "name": "branch_id",
+                    "in": "path",
+                    "required": true,
+                    "schema": { "type": "string" },
+                },
                 "CursorQuery": {
                     "name": "cursor",
                     "in": "query",
                     "required": false,
                     "schema": { "type": "integer", "format": "int64", "minimum": 0 },
+                },
+                "BranchQuery": {
+                    "name": "branch",
+                    "in": "query",
+                    "required": false,
+                    "schema": { "type": "string", "default": "main" },
                 },
                 "ReplayLimitQuery": {
                     "name": "replay_limit",
@@ -331,7 +420,60 @@ pub fn openapi_spec() -> Value {
                     "required": ["objective"],
                     "properties": {
                         "objective": { "type": "string" },
+                        "branch": { "type": "string", "default": "main" },
                         "proposed_tool": { "$ref": "#/components/schemas/ProposedToolRequest" },
+                    },
+                },
+                "CreateBranchRequest": {
+                    "type": "object",
+                    "required": ["branch"],
+                    "properties": {
+                        "branch": { "type": "string" },
+                        "from_branch": { "type": "string", "default": "main" },
+                        "fork_sequence": { "type": "integer", "format": "int64", "minimum": 0 },
+                    },
+                },
+                "BranchInfo": {
+                    "type": "object",
+                    "required": ["branch_id", "fork_sequence", "head_sequence"],
+                    "properties": {
+                        "branch_id": { "type": "string" },
+                        "parent_branch": { "type": "string", "nullable": true },
+                        "fork_sequence": { "type": "integer", "format": "int64", "minimum": 0 },
+                        "head_sequence": { "type": "integer", "format": "int64", "minimum": 0 },
+                        "merged_into": { "type": "string", "nullable": true },
+                    },
+                },
+                "BranchListResponse": {
+                    "type": "object",
+                    "required": ["session_id", "branches"],
+                    "properties": {
+                        "session_id": { "type": "string", "format": "uuid" },
+                        "branches": { "type": "array", "items": { "$ref": "#/components/schemas/BranchInfo" } },
+                    },
+                },
+                "MergeBranchRequest": {
+                    "type": "object",
+                    "properties": {
+                        "target_branch": { "type": "string", "default": "main" },
+                    },
+                },
+                "BranchMergeResult": {
+                    "type": "object",
+                    "required": ["source_branch", "target_branch", "source_head_sequence", "target_head_sequence"],
+                    "properties": {
+                        "source_branch": { "type": "string" },
+                        "target_branch": { "type": "string" },
+                        "source_head_sequence": { "type": "integer", "format": "int64", "minimum": 0 },
+                        "target_head_sequence": { "type": "integer", "format": "int64", "minimum": 0 },
+                    },
+                },
+                "BranchMergeResponse": {
+                    "type": "object",
+                    "required": ["session_id", "result"],
+                    "properties": {
+                        "session_id": { "type": "string", "format": "uuid" },
+                        "result": { "$ref": "#/components/schemas/BranchMergeResult" },
                     },
                 },
                 "BudgetState": {
@@ -385,9 +527,10 @@ pub fn openapi_spec() -> Value {
                 },
                 "EventListResponse": {
                     "type": "object",
-                    "required": ["session_id", "from_sequence", "events"],
+                    "required": ["session_id", "branch", "from_sequence", "events"],
                     "properties": {
                         "session_id": { "type": "string", "format": "uuid" },
+                        "branch": { "type": "string" },
                         "from_sequence": { "type": "integer", "format": "int64", "minimum": 1 },
                         "events": { "type": "array", "items": { "$ref": "#/components/schemas/EventRecord" } },
                     },
@@ -462,6 +605,10 @@ mod tests {
         assert!(spec["paths"]["/openapi.json"].is_object());
         assert!(spec["paths"]["/docs"].is_object());
         assert!(spec["paths"]["/sessions/{session_id}/events/stream/vercel-ai-sdk-v6"].is_object());
+        assert!(spec["paths"]["/sessions/{session_id}/branches"].is_object());
+        assert!(spec["paths"]["/sessions/{session_id}/branches/{branch_id}/merge"].is_object());
+        assert!(spec["components"]["parameters"]["BranchPath"].is_object());
+        assert!(spec["components"]["schemas"]["BranchInfo"].is_object());
     }
 
     #[test]

@@ -73,7 +73,7 @@ pub fn part_as_sse_event(part: &VercelAiSdkV6Part) -> Event {
 
 #[cfg(test)]
 mod tests {
-    use aios_model::{EventKind, EventRecord, SessionId};
+    use aios_model::{BranchId, EventKind, EventRecord, SessionId};
     use serde_json::{Value, json};
     use uuid::Uuid;
 
@@ -99,6 +99,7 @@ mod tests {
         let session_id = SessionId(Uuid::nil());
         let event = EventRecord::new(
             session_id,
+            BranchId::main(),
             3,
             EventKind::Heartbeat {
                 summary: "ok".to_owned(),

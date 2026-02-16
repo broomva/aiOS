@@ -13,6 +13,9 @@ Expose session lifecycle, ticking, approvals, and event replay/streaming over HT
 - `GET /docs` (Scalar interactive docs)
 - `POST /sessions`
 - `POST /sessions/{session_id}/ticks`
+- `POST /sessions/{session_id}/branches`
+- `GET /sessions/{session_id}/branches`
+- `POST /sessions/{session_id}/branches/{branch_id}/merge`
 - `POST /sessions/{session_id}/approvals/{approval_id}`
 - `GET /sessions/{session_id}/events`
 - `GET /sessions/{session_id}/events/stream?cursor=...`

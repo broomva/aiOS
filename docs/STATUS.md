@@ -22,12 +22,16 @@ Last updated: 2026-02-15
 10. OpenAPI 3.1 spec endpoint and Scalar interactive docs route.
 11. CI OpenAPI schema validation and pre-commit/pre-push hook configuration.
 12. Filesystem + harness architecture evaluation with Lago fit/gap analysis.
+13. Strict per-session sequence monotonicity enforcement in the event store, with stream gap backfill on lagged/live SSE paths (native and Vercel v6).
+14. Branch-aware event model (`branch_id`) with branch-scoped sequences, reads, and SSE stream filtering/querying.
+15. Branch lifecycle hardening: fork-sequence bounds validation, merge-safety rules, and merged-branch read-only enforcement.
+16. Structured `tracing` spans across kernel/runtime/tool/sandbox/event-store boundaries for operator-grade execution visibility.
 
 ## In Progress / Partial
 
-1. Replay determinism guarantees are partial.
+1. Replay determinism guarantees are improving (sequence + backfill guards in place) but still partial end-to-end.
 2. Crash-recovery tests need explicit failure-injection scenarios.
-3. Observability/metrics beyond logs are limited.
+3. Metrics and SLO dashboards beyond structured logs/traces are limited.
 
 ## Not Yet Implemented
 

@@ -21,6 +21,29 @@ impl Default for SessionId {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct BranchId(pub String);
+
+impl BranchId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn main() -> Self {
+        Self("main".to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for BranchId {
+    fn default() -> Self {
+        Self::main()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct EventId(pub Uuid);
 
@@ -213,6 +236,23 @@ pub struct SessionManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchInfo {
+    pub branch_id: BranchId,
+    pub parent_branch: Option<BranchId>,
+    pub fork_sequence: u64,
+    pub head_sequence: u64,
+    pub merged_into: Option<BranchId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchMergeResult {
+    pub source_branch: BranchId,
+    pub target_branch: BranchId,
+    pub source_head_sequence: u64,
+    pub target_head_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub call_id: Uuid,
     pub tool_name: String,
@@ -259,6 +299,16 @@ pub enum LoopPhase {
 pub enum EventKind {
     SessionCreated {
         manifest_hash: String,
+    },
+    BranchCreated {
+        branch_id: BranchId,
+        from_branch: BranchId,
+        fork_sequence: u64,
+    },
+    BranchMerged {
+        source_branch: BranchId,
+        target_branch: BranchId,
+        source_head_sequence: u64,
     },
     PhaseEntered {
         phase: LoopPhase,
@@ -353,6 +403,7 @@ pub enum EventKind {
 pub struct EventRecord {
     pub event_id: EventId,
     pub session_id: SessionId,
+    pub branch_id: BranchId,
     pub sequence: u64,
     pub timestamp: DateTime<Utc>,
     pub causation_id: Option<EventId>,
@@ -361,10 +412,11 @@ pub struct EventRecord {
 }
 
 impl EventRecord {
-    pub fn new(session_id: SessionId, sequence: u64, kind: EventKind) -> Self {
+    pub fn new(session_id: SessionId, branch_id: BranchId, sequence: u64, kind: EventKind) -> Self {
         Self {
             event_id: EventId::new(),
             session_id,
+            branch_id,
             sequence,
             timestamp: Utc::now(),
             causation_id: None,
@@ -419,6 +471,7 @@ impl Default for SoulProfile {
 pub struct CheckpointManifest {
     pub checkpoint_id: CheckpointId,
     pub session_id: SessionId,
+    pub branch_id: BranchId,
     pub created_at: DateTime<Utc>,
     pub event_sequence: u64,
     pub state_hash: String,

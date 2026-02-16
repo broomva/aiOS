@@ -4,13 +4,15 @@ use std::sync::Arc;
 use aios_events::{EventJournal, EventStreamHub, FileEventStore};
 use aios_memory::WorkspaceMemoryStore;
 use aios_model::{
-    EventKind, EventRecord, ModelRouting, PolicySet, SessionId, SessionManifest, ToolCall,
+    BranchId, BranchInfo, BranchMergeResult, EventKind, EventRecord, ModelRouting, PolicySet,
+    SessionId, SessionManifest, ToolCall,
 };
 use aios_policy::{ApprovalQueue, SessionPolicyEngine};
 use aios_runtime::{KernelRuntime, RuntimeConfig, TickInput, TickOutput};
 use aios_sandbox::LocalSandboxRunner;
 use aios_tools::{ToolDispatcher, ToolRegistry};
 use anyhow::Result;
+use tracing::instrument;
 
 #[derive(Debug, Clone)]
 pub struct KernelBuilder {
@@ -73,6 +75,7 @@ pub struct AiosKernel {
 }
 
 impl AiosKernel {
+    #[instrument(skip(self, owner, policy, model_routing))]
     pub async fn create_session(
         &self,
         owner: impl Into<String>,
@@ -84,20 +87,81 @@ impl AiosKernel {
             .await
     }
 
+    #[instrument(skip(self, objective, proposed_tool), fields(session_id = %session_id.0))]
     pub async fn tick(
         &self,
         session_id: SessionId,
         objective: impl Into<String>,
         proposed_tool: Option<ToolCall>,
     ) -> Result<TickOutput> {
+        self.tick_on_branch(session_id, BranchId::main(), objective, proposed_tool)
+            .await
+    }
+
+    #[instrument(
+        skip(self, objective, proposed_tool),
+        fields(session_id = %session_id.0, branch = %branch_id.as_str())
+    )]
+    pub async fn tick_on_branch(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        objective: impl Into<String>,
+        proposed_tool: Option<ToolCall>,
+    ) -> Result<TickOutput> {
         self.runtime
-            .tick(
+            .tick_on_branch(
                 session_id,
+                branch_id,
                 TickInput {
                     objective: objective.into(),
                     proposed_tool,
                 },
             )
+            .await
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
+            session_id = %session_id.0,
+            branch = %branch_id.as_str(),
+            from_branch = ?from_branch.as_ref().map(|branch| branch.as_str())
+        )
+    )]
+    pub async fn create_branch(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        from_branch: Option<BranchId>,
+        fork_sequence: Option<u64>,
+    ) -> Result<BranchInfo> {
+        self.runtime
+            .create_branch(session_id, branch_id, from_branch, fork_sequence)
+            .await
+    }
+
+    #[instrument(skip(self), fields(session_id = %session_id.0))]
+    pub async fn list_branches(&self, session_id: SessionId) -> Result<Vec<BranchInfo>> {
+        self.runtime.list_branches(session_id).await
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
+            session_id = %session_id.0,
+            source_branch = %source_branch.as_str(),
+            target_branch = %target_branch.as_str()
+        )
+    )]
+    pub async fn merge_branch(
+        &self,
+        session_id: SessionId,
+        source_branch: BranchId,
+        target_branch: BranchId,
+    ) -> Result<BranchMergeResult> {
+        self.runtime
+            .merge_branch(session_id, source_branch, target_branch)
             .await
     }
 
@@ -122,7 +186,19 @@ impl AiosKernel {
         session_id: SessionId,
         kind: EventKind,
     ) -> Result<()> {
-        self.runtime.record_external_event(session_id, kind).await
+        self.record_external_event_on_branch(session_id, BranchId::main(), kind)
+            .await
+    }
+
+    pub async fn record_external_event_on_branch(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        kind: EventKind,
+    ) -> Result<()> {
+        self.runtime
+            .record_external_event_on_branch(session_id, branch_id, kind)
+            .await
     }
 
     pub async fn read_events(
@@ -131,8 +207,19 @@ impl AiosKernel {
         from_sequence: u64,
         limit: usize,
     ) -> Result<Vec<EventRecord>> {
+        self.read_events_on_branch(session_id, BranchId::main(), from_sequence, limit)
+            .await
+    }
+
+    pub async fn read_events_on_branch(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        from_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>> {
         self.runtime
-            .read_events(session_id, from_sequence, limit)
+            .read_events_on_branch(session_id, branch_id, from_sequence, limit)
             .await
     }
 }
@@ -142,7 +229,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use aios_model::{Capability, OperatingMode, PolicySet, ToolCall};
+    use aios_model::{BranchId, Capability, OperatingMode, PolicySet, ToolCall};
     use anyhow::Result;
     use serde_json::json;
     use tokio::fs;
@@ -238,6 +325,222 @@ mod tests {
         assert!(matches!(tick.mode, OperatingMode::Recover));
         assert_eq!(tick.state.error_streak, 1);
         assert_eq!(tick.state.budget.error_budget_remaining, 7);
+
+        let _ = fs::remove_dir_all(root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branch_ticks_keep_independent_sequences() -> Result<()> {
+        let root = unique_test_root("aios-kernel-branches");
+        let kernel = KernelBuilder::new(&root).build();
+        let session = kernel
+            .create_session("tester", PolicySet::default(), None)
+            .await?;
+
+        let feature = BranchId::new("feature-a");
+        let created = kernel
+            .create_branch(
+                session.session_id,
+                feature.clone(),
+                Some(BranchId::main()),
+                None,
+            )
+            .await?;
+        assert_eq!(created.branch_id, feature);
+        let _ = kernel
+            .tick_on_branch(session.session_id, BranchId::main(), "main tick", None)
+            .await?;
+        let _ = kernel
+            .tick_on_branch(session.session_id, feature.clone(), "feature tick", None)
+            .await?;
+
+        let main_events = kernel
+            .read_events_on_branch(session.session_id, BranchId::main(), 1, 256)
+            .await?;
+        let feature_events = kernel
+            .read_events_on_branch(session.session_id, feature.clone(), 1, 256)
+            .await?;
+
+        assert!(!main_events.is_empty());
+        assert!(!feature_events.is_empty());
+        assert!(
+            feature_events
+                .iter()
+                .all(|event| event.branch_id == feature)
+        );
+        assert_eq!(feature_events[0].sequence, 1);
+
+        let _ = fs::remove_dir_all(root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_reads_are_stable_per_branch() -> Result<()> {
+        let root = unique_test_root("aios-kernel-replay");
+        let kernel = KernelBuilder::new(&root).build();
+        let session = kernel
+            .create_session("tester", PolicySet::default(), None)
+            .await?;
+
+        let feature = BranchId::new("feature-replay");
+        kernel
+            .create_branch(
+                session.session_id,
+                feature.clone(),
+                Some(BranchId::main()),
+                None,
+            )
+            .await?;
+
+        let _ = kernel
+            .tick_on_branch(session.session_id, BranchId::main(), "main tick 1", None)
+            .await?;
+        let main_snapshot = kernel
+            .read_events_on_branch(session.session_id, BranchId::main(), 1, 512)
+            .await?;
+        let main_snapshot_json = serde_json::to_string(&main_snapshot)?;
+
+        let _ = kernel
+            .tick_on_branch(session.session_id, feature.clone(), "feature tick 1", None)
+            .await?;
+
+        let main_after_feature = kernel
+            .read_events_on_branch(session.session_id, BranchId::main(), 1, 512)
+            .await?;
+        let main_after_feature_json = serde_json::to_string(&main_after_feature)?;
+        assert_eq!(main_snapshot_json, main_after_feature_json);
+
+        let feature_events_first = kernel
+            .read_events_on_branch(session.session_id, feature.clone(), 1, 512)
+            .await?;
+        let feature_events_second = kernel
+            .read_events_on_branch(session.session_id, feature.clone(), 1, 512)
+            .await?;
+        assert_eq!(
+            serde_json::to_string(&feature_events_first)?,
+            serde_json::to_string(&feature_events_second)?
+        );
+
+        let _ = fs::remove_dir_all(root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn merged_branch_becomes_read_only() -> Result<()> {
+        let root = unique_test_root("aios-kernel-merge-readonly");
+        let kernel = KernelBuilder::new(&root).build();
+        let session = kernel
+            .create_session("tester", PolicySet::default(), None)
+            .await?;
+
+        let feature = BranchId::new("feature-merge");
+        kernel
+            .create_branch(
+                session.session_id,
+                feature.clone(),
+                Some(BranchId::main()),
+                None,
+            )
+            .await?;
+
+        let _ = kernel
+            .tick_on_branch(session.session_id, feature.clone(), "feature tick 1", None)
+            .await?;
+
+        let merge = kernel
+            .merge_branch(session.session_id, feature.clone(), BranchId::main())
+            .await?;
+        assert_eq!(merge.source_branch, feature);
+
+        let branches = kernel.list_branches(session.session_id).await?;
+        let feature_info = branches
+            .iter()
+            .find(|branch| branch.branch_id == feature)
+            .expect("feature branch exists after merge");
+        assert_eq!(feature_info.merged_into, Some(BranchId::main()));
+
+        let second_merge_error = kernel
+            .merge_branch(session.session_id, feature.clone(), BranchId::main())
+            .await
+            .expect_err("branch should not merge twice");
+        assert!(second_merge_error.to_string().contains("already merged"));
+
+        let tick_error = kernel
+            .tick_on_branch(
+                session.session_id,
+                feature.clone(),
+                "tick after merge",
+                None,
+            )
+            .await
+            .expect_err("merged branch should be read-only");
+        assert!(tick_error.to_string().contains("read-only"));
+
+        let _ = kernel
+            .tick_on_branch(
+                session.session_id,
+                BranchId::main(),
+                "main still writable",
+                None,
+            )
+            .await?;
+
+        let _ = fs::remove_dir_all(root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_branch_rejects_fork_sequence_past_source_head() -> Result<()> {
+        let root = unique_test_root("aios-kernel-fork-sequence");
+        let kernel = KernelBuilder::new(&root).build();
+        let session = kernel
+            .create_session("tester", PolicySet::default(), None)
+            .await?;
+
+        let feature = BranchId::new("feature-invalid-fork");
+        let error = kernel
+            .create_branch(
+                session.session_id,
+                feature,
+                Some(BranchId::main()),
+                Some(1_000),
+            )
+            .await
+            .expect_err("fork sequence beyond source head should fail");
+        assert!(error.to_string().contains("exceeds source branch head"));
+
+        let _ = fs::remove_dir_all(root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn merge_rejects_main_as_source_branch() -> Result<()> {
+        let root = unique_test_root("aios-kernel-main-merge-source");
+        let kernel = KernelBuilder::new(&root).build();
+        let session = kernel
+            .create_session("tester", PolicySet::default(), None)
+            .await?;
+
+        let feature = BranchId::new("feature-main-merge");
+        kernel
+            .create_branch(
+                session.session_id,
+                feature.clone(),
+                Some(BranchId::main()),
+                None,
+            )
+            .await?;
+
+        let error = kernel
+            .merge_branch(session.session_id, BranchId::main(), feature)
+            .await
+            .expect_err("main should not be a merge source");
+        assert!(
+            error
+                .to_string()
+                .contains("main branch cannot be used as a merge source")
+        );
 
         let _ = fs::remove_dir_all(root).await;
         Ok(())

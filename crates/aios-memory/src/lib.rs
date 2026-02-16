@@ -157,7 +157,11 @@ pub fn extract_observation(event: &EventRecord) -> Option<Observation> {
             event_start: event.sequence,
             event_end: event.sequence,
             files: vec![FileProvenance {
-                path: format!("events/{}.jsonl", event.session_id.0.hyphenated()),
+                path: format!(
+                    "events/{}.jsonl#branch={}",
+                    event.session_id.0.hyphenated(),
+                    event.branch_id.as_str()
+                ),
                 sha256: "pending".to_owned(),
             }],
         },

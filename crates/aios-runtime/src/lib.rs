@@ -5,9 +5,9 @@ use std::sync::Arc;
 use aios_events::EventJournal;
 use aios_memory::{MemoryStore, extract_observation};
 use aios_model::{
-    AgentStateVector, BudgetState, CheckpointId, CheckpointManifest, EventKind, EventRecord,
-    LoopPhase, ModelRouting, OperatingMode, PolicySet, RiskLevel, SessionId, SessionManifest,
-    ToolCall, ToolOutcome,
+    AgentStateVector, BranchId, BranchInfo, BranchMergeResult, BudgetState, CheckpointId,
+    CheckpointManifest, EventKind, EventRecord, LoopPhase, ModelRouting, OperatingMode, PolicySet,
+    RiskLevel, SessionId, SessionManifest, ToolCall, ToolOutcome,
 };
 use aios_policy::{ApprovalQueue, SessionPolicyEngine};
 use aios_tools::{DispatchResult, ToolContext, ToolDispatcher, ToolExecutionReport};
@@ -17,6 +17,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -54,10 +55,19 @@ pub struct TickOutput {
 #[derive(Debug, Clone)]
 struct SessionRuntimeState {
     manifest: SessionManifest,
-    next_sequence: u64,
+    next_sequence_by_branch: HashMap<BranchId, u64>,
+    branches: HashMap<BranchId, BranchRuntimeState>,
     tick_count: u64,
     mode: OperatingMode,
     state_vector: AgentStateVector,
+}
+
+#[derive(Debug, Clone)]
+struct BranchRuntimeState {
+    parent_branch: Option<BranchId>,
+    fork_sequence: u64,
+    head_sequence: u64,
+    merged_into: Option<BranchId>,
 }
 
 #[derive(Clone)]
@@ -91,6 +101,7 @@ impl KernelRuntime {
         }
     }
 
+    #[instrument(skip(self, owner, policy, model_routing))]
     pub async fn create_session(
         &self,
         owner: impl Into<String>,
@@ -116,12 +127,30 @@ impl KernelRuntime {
 
         let manifest_hash = sha256_json(&manifest)?;
 
-        let latest_sequence = self.journal.latest_sequence(session_id).await.unwrap_or(0);
+        let main_branch = BranchId::main();
+        let latest_sequence = self
+            .journal
+            .latest_sequence(session_id, Some(main_branch.clone()))
+            .await
+            .unwrap_or(0);
+        let mut next_sequence_by_branch = HashMap::new();
+        next_sequence_by_branch.insert(main_branch.clone(), latest_sequence + 1);
+        let mut branches = HashMap::new();
+        branches.insert(
+            main_branch.clone(),
+            BranchRuntimeState {
+                parent_branch: None,
+                fork_sequence: 0,
+                head_sequence: latest_sequence,
+                merged_into: None,
+            },
+        );
         self.sessions.lock().insert(
             session_id,
             SessionRuntimeState {
                 manifest: manifest.clone(),
-                next_sequence: latest_sequence + 1,
+                next_sequence_by_branch,
+                branches,
                 tick_count: 0,
                 mode: OperatingMode::Explore,
                 state_vector: AgentStateVector::default(),
@@ -131,15 +160,45 @@ impl KernelRuntime {
             .set_policy(session_id, &manifest.policy)
             .await;
 
-        self.append_event(session_id, EventKind::SessionCreated { manifest_hash })
+        self.append_event(
+            session_id,
+            &main_branch,
+            EventKind::SessionCreated { manifest_hash },
+        )
+        .await?;
+
+        self.emit_phase(session_id, &main_branch, LoopPhase::Sleep)
             .await?;
 
-        self.emit_phase(session_id, LoopPhase::Sleep).await?;
+        info!(
+            session_id = %session_id.0,
+            workspace_root = %manifest.workspace_root,
+            "session created"
+        );
 
         Ok(manifest)
     }
 
     pub async fn tick(&self, session_id: SessionId, input: TickInput) -> Result<TickOutput> {
+        self.tick_on_branch(session_id, BranchId::main(), input)
+            .await
+    }
+
+    #[instrument(
+        skip(self, input),
+        fields(
+            session_id = %session_id.0,
+            branch = %branch_id.as_str(),
+            objective_len = input.objective.len(),
+            has_tool = input.proposed_tool.is_some()
+        )
+    )]
+    pub async fn tick_on_branch(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        input: TickInput,
+    ) -> Result<TickOutput> {
         let (manifest, mut state) = {
             let sessions = self.sessions.lock();
             let session = sessions
@@ -150,11 +209,16 @@ impl KernelRuntime {
 
         let mut emitted = 0_u64;
 
-        emitted += self.emit_phase(session_id, LoopPhase::Perceive).await?;
-        emitted += self.emit_phase(session_id, LoopPhase::Deliberate).await?;
+        emitted += self
+            .emit_phase(session_id, &branch_id, LoopPhase::Perceive)
+            .await?;
+        emitted += self
+            .emit_phase(session_id, &branch_id, LoopPhase::Deliberate)
+            .await?;
 
         self.append_event(
             session_id,
+            &branch_id,
             EventKind::DeliberationProposed {
                 summary: input.objective.clone(),
                 proposed_tool: input.proposed_tool.clone(),
@@ -168,6 +232,7 @@ impl KernelRuntime {
 
         self.append_event(
             session_id,
+            &branch_id,
             EventKind::StateEstimated {
                 state: state.clone(),
                 mode: mode.clone(),
@@ -175,20 +240,24 @@ impl KernelRuntime {
         )
         .await?;
         emitted += 1;
+        debug!(mode = ?mode, uncertainty = state.uncertainty, "state estimated");
 
         if matches!(mode, OperatingMode::AskHuman | OperatingMode::Sleep) {
             emitted += self
-                .finalize_tick(session_id, &manifest, &mut state, &mode)
+                .finalize_tick(session_id, &branch_id, &manifest, &mut state, &mode)
                 .await?;
             return self
-                .current_tick_output(session_id, mode, state, emitted)
+                .current_tick_output(session_id, &branch_id, mode, state, emitted)
                 .await;
         }
 
         if let Some(call) = input.proposed_tool {
-            emitted += self.emit_phase(session_id, LoopPhase::Gate).await?;
+            emitted += self
+                .emit_phase(session_id, &branch_id, LoopPhase::Gate)
+                .await?;
             self.append_event(
                 session_id,
+                &branch_id,
                 EventKind::ToolCallRequested { call: call.clone() },
             )
             .await?;
@@ -205,6 +274,10 @@ impl KernelRuntime {
             {
                 Ok(DispatchResult::NeedsApproval { evaluation, .. }) => {
                     mode = OperatingMode::AskHuman;
+                    info!(
+                        approval_count = evaluation.requires_approval.len(),
+                        "tool execution requires approval"
+                    );
                     for capability in evaluation.requires_approval {
                         let ticket = self
                             .approvals
@@ -216,6 +289,7 @@ impl KernelRuntime {
                             .await;
                         self.append_event(
                             session_id,
+                            &branch_id,
                             EventKind::ApprovalRequested {
                                 approval_id: ticket.approval_id,
                                 reason: ticket.reason,
@@ -227,12 +301,21 @@ impl KernelRuntime {
                     }
                 }
                 Ok(DispatchResult::Executed(report)) => {
-                    emitted += self.emit_phase(session_id, LoopPhase::Execute).await?;
                     emitted += self
-                        .record_tool_report(session_id, &manifest, &report)
+                        .emit_phase(session_id, &branch_id, LoopPhase::Execute)
+                        .await?;
+                    emitted += self
+                        .record_tool_report(session_id, &branch_id, &manifest, &report)
                         .await?;
                     self.apply_homeostasis_controllers(&mut state, &report);
                     mode = self.estimate_mode(&state, 0);
+                    info!(
+                        tool_name = %report.tool_name,
+                        tool_run_id = %report.tool_run_id.0,
+                        exit_status = report.exit_status,
+                        mode = ?mode,
+                        "tool execution completed"
+                    );
                 }
                 Err(error) => {
                     state.error_streak += 1;
@@ -240,9 +323,11 @@ impl KernelRuntime {
                     state.budget.error_budget_remaining =
                         state.budget.error_budget_remaining.saturating_sub(1);
                     mode = OperatingMode::Recover;
+                    warn!(error = %error, error_streak = state.error_streak, "tool execution failed");
 
                     self.append_event(
                         session_id,
+                        &branch_id,
                         EventKind::ErrorRaised {
                             message: error.to_string(),
                         },
@@ -255,8 +340,14 @@ impl KernelRuntime {
 
         if state.error_streak >= self.config.circuit_breaker_errors {
             mode = OperatingMode::Recover;
+            warn!(
+                error_streak = state.error_streak,
+                threshold = self.config.circuit_breaker_errors,
+                "circuit breaker tripped"
+            );
             self.append_event(
                 session_id,
+                &branch_id,
                 EventKind::CircuitBreakerTripped {
                     reason: "error streak exceeded threshold".to_owned(),
                     error_streak: state.error_streak,
@@ -267,10 +358,196 @@ impl KernelRuntime {
         }
 
         emitted += self
-            .finalize_tick(session_id, &manifest, &mut state, &mode)
+            .finalize_tick(session_id, &branch_id, &manifest, &mut state, &mode)
             .await?;
-        self.current_tick_output(session_id, mode, state, emitted)
+        info!(mode = ?mode, emitted, "tick finalized");
+        self.current_tick_output(session_id, &branch_id, mode, state, emitted)
             .await
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
+            session_id = %session_id.0,
+            branch = %branch_id.as_str(),
+            from_branch = ?from_branch.as_ref().map(|branch| branch.as_str())
+        )
+    )]
+    pub async fn create_branch(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        from_branch: Option<BranchId>,
+        fork_sequence: Option<u64>,
+    ) -> Result<BranchInfo> {
+        let from_branch = from_branch.unwrap_or_else(BranchId::main);
+        let fork_sequence_value = {
+            let mut sessions = self.sessions.lock();
+            let session = sessions
+                .get_mut(&session_id)
+                .with_context(|| format!("session not found: {}", session_id.0))?;
+            if session.branches.contains_key(&branch_id) {
+                bail!("branch already exists: {}", branch_id.as_str());
+            }
+            let parent = session
+                .branches
+                .get(&from_branch)
+                .with_context(|| format!("source branch not found: {}", from_branch.as_str()))?;
+            if let Some(target) = &parent.merged_into {
+                bail!(
+                    "source branch {} is merged into {} and is read-only",
+                    from_branch.as_str(),
+                    target.as_str()
+                );
+            }
+            let fork = fork_sequence.unwrap_or(parent.head_sequence);
+            if fork > parent.head_sequence {
+                bail!(
+                    "fork sequence {} exceeds source branch head {}",
+                    fork,
+                    parent.head_sequence
+                );
+            }
+
+            session.next_sequence_by_branch.insert(branch_id.clone(), 1);
+            session.branches.insert(
+                branch_id.clone(),
+                BranchRuntimeState {
+                    parent_branch: Some(from_branch.clone()),
+                    fork_sequence: fork,
+                    head_sequence: 0,
+                    merged_into: None,
+                },
+            );
+            fork
+        };
+
+        self.append_event(
+            session_id,
+            &branch_id,
+            EventKind::BranchCreated {
+                branch_id: branch_id.clone(),
+                from_branch: from_branch.clone(),
+                fork_sequence: fork_sequence_value,
+            },
+        )
+        .await?;
+        info!(
+            branch = %branch_id.as_str(),
+            from_branch = %from_branch.as_str(),
+            fork_sequence = fork_sequence_value,
+            "branch created"
+        );
+
+        self.branch_info(session_id, &branch_id)
+    }
+
+    pub async fn list_branches(&self, session_id: SessionId) -> Result<Vec<BranchInfo>> {
+        let sessions = self.sessions.lock();
+        let session = sessions
+            .get(&session_id)
+            .with_context(|| format!("session not found: {}", session_id.0))?;
+
+        let mut branches: Vec<_> = session
+            .branches
+            .iter()
+            .map(|(branch_id, state)| BranchInfo {
+                branch_id: branch_id.clone(),
+                parent_branch: state.parent_branch.clone(),
+                fork_sequence: state.fork_sequence,
+                head_sequence: state.head_sequence,
+                merged_into: state.merged_into.clone(),
+            })
+            .collect();
+        branches.sort_by(|a, b| a.branch_id.as_str().cmp(b.branch_id.as_str()));
+        Ok(branches)
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
+            session_id = %session_id.0,
+            source_branch = %source_branch.as_str(),
+            target_branch = %target_branch.as_str()
+        )
+    )]
+    pub async fn merge_branch(
+        &self,
+        session_id: SessionId,
+        source_branch: BranchId,
+        target_branch: BranchId,
+    ) -> Result<BranchMergeResult> {
+        if source_branch == target_branch {
+            bail!("source and target branch must differ");
+        }
+        if source_branch == BranchId::main() {
+            bail!("main branch cannot be used as a merge source");
+        }
+
+        let source_head =
+            {
+                let sessions = self.sessions.lock();
+                let session = sessions
+                    .get(&session_id)
+                    .with_context(|| format!("session not found: {}", session_id.0))?;
+                let source = session.branches.get(&source_branch).with_context(|| {
+                    format!("source branch not found: {}", source_branch.as_str())
+                })?;
+                if let Some(merged_into) = &source.merged_into {
+                    bail!(
+                        "source branch {} already merged into {}",
+                        source_branch.as_str(),
+                        merged_into.as_str()
+                    );
+                }
+                let target = session.branches.get(&target_branch).with_context(|| {
+                    format!("target branch not found: {}", target_branch.as_str())
+                })?;
+                if let Some(merged_into) = &target.merged_into {
+                    bail!(
+                        "target branch {} is merged into {} and is read-only",
+                        target_branch.as_str(),
+                        merged_into.as_str()
+                    );
+                }
+                source.head_sequence
+            };
+
+        self.append_event(
+            session_id,
+            &target_branch,
+            EventKind::BranchMerged {
+                source_branch: source_branch.clone(),
+                target_branch: target_branch.clone(),
+                source_head_sequence: source_head,
+            },
+        )
+        .await?;
+
+        let target_head = self.peek_last_sequence(session_id, &target_branch)?;
+        {
+            let mut sessions = self.sessions.lock();
+            let session = sessions
+                .get_mut(&session_id)
+                .with_context(|| format!("session not found: {}", session_id.0))?;
+            let source = session
+                .branches
+                .get_mut(&source_branch)
+                .with_context(|| format!("source branch not found: {}", source_branch.as_str()))?;
+            source.merged_into = Some(target_branch.clone());
+        }
+        info!(
+            source_head_sequence = source_head,
+            target_head_sequence = target_head,
+            "branch merged"
+        );
+
+        Ok(BranchMergeResult {
+            source_branch,
+            target_branch,
+            source_head_sequence: source_head,
+            target_head_sequence: target_head,
+        })
     }
 
     pub async fn resolve_approval(
@@ -289,6 +566,7 @@ impl KernelRuntime {
 
         self.append_event(
             session_id,
+            &BranchId::main(),
             EventKind::ApprovalResolved {
                 approval_id,
                 approved: resolution.approved,
@@ -308,13 +586,27 @@ impl KernelRuntime {
         session_id: SessionId,
         kind: EventKind,
     ) -> Result<()> {
+        self.record_external_event_on_branch(session_id, BranchId::main(), kind)
+            .await
+    }
+
+    #[instrument(
+        skip(self, kind),
+        fields(session_id = %session_id.0, branch = %branch_id.as_str())
+    )]
+    pub async fn record_external_event_on_branch(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        kind: EventKind,
+    ) -> Result<()> {
         {
             let sessions = self.sessions.lock();
             if !sessions.contains_key(&session_id) {
                 bail!("session not found: {}", session_id.0);
             }
         }
-        self.append_event(session_id, kind).await
+        self.append_event(session_id, &branch_id, kind).await
     }
 
     pub async fn read_events(
@@ -323,8 +615,19 @@ impl KernelRuntime {
         from_sequence: u64,
         limit: usize,
     ) -> Result<Vec<EventRecord>> {
+        self.read_events_on_branch(session_id, BranchId::main(), from_sequence, limit)
+            .await
+    }
+
+    pub async fn read_events_on_branch(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        from_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>> {
         self.journal
-            .read_from(session_id, from_sequence, limit)
+            .read_from(session_id, Some(branch_id), from_sequence, limit)
             .await
     }
 
@@ -389,16 +692,20 @@ impl KernelRuntime {
     async fn finalize_tick(
         &self,
         session_id: SessionId,
+        branch_id: &BranchId,
         manifest: &SessionManifest,
         state: &mut AgentStateVector,
         mode: &OperatingMode,
     ) -> Result<u64> {
         let mut emitted = 0_u64;
 
-        emitted += self.emit_phase(session_id, LoopPhase::Reflect).await?;
+        emitted += self
+            .emit_phase(session_id, branch_id, LoopPhase::Reflect)
+            .await?;
 
         self.append_event(
             session_id,
+            branch_id,
             EventKind::BudgetUpdated {
                 budget: state.budget.clone(),
                 reason: "tick accounting".to_owned(),
@@ -409,6 +716,7 @@ impl KernelRuntime {
 
         self.append_event(
             session_id,
+            branch_id,
             EventKind::StateEstimated {
                 state: state.clone(),
                 mode: mode.clone(),
@@ -418,9 +726,12 @@ impl KernelRuntime {
         emitted += 1;
 
         let checkpoint_id = if self.should_checkpoint(session_id)? {
-            let checkpoint = self.create_checkpoint(session_id, manifest, state).await?;
+            let checkpoint = self
+                .create_checkpoint(session_id, branch_id, manifest, state)
+                .await?;
             self.append_event(
                 session_id,
+                branch_id,
                 EventKind::CheckpointCreated {
                     checkpoint_id: checkpoint.checkpoint_id,
                     event_sequence: checkpoint.event_sequence,
@@ -437,6 +748,7 @@ impl KernelRuntime {
         self.write_heartbeat(session_id, state, mode).await?;
         self.append_event(
             session_id,
+            branch_id,
             EventKind::Heartbeat {
                 summary: "tick complete".to_owned(),
                 checkpoint_id,
@@ -445,7 +757,9 @@ impl KernelRuntime {
         .await?;
         emitted += 1;
 
-        emitted += self.emit_phase(session_id, LoopPhase::Sleep).await?;
+        emitted += self
+            .emit_phase(session_id, branch_id, LoopPhase::Sleep)
+            .await?;
 
         self.persist_runtime_state(session_id, state.clone(), mode.clone())?;
 
@@ -455,6 +769,7 @@ impl KernelRuntime {
     async fn record_tool_report(
         &self,
         session_id: SessionId,
+        branch_id: &BranchId,
         manifest: &SessionManifest,
         report: &ToolExecutionReport,
     ) -> Result<u64> {
@@ -462,6 +777,7 @@ impl KernelRuntime {
 
         self.append_event(
             session_id,
+            branch_id,
             EventKind::ToolCallStarted {
                 tool_run_id: report.tool_run_id,
                 tool_name: report.tool_name.clone(),
@@ -472,6 +788,7 @@ impl KernelRuntime {
 
         self.append_event(
             session_id,
+            branch_id,
             EventKind::ToolCallCompleted {
                 tool_run_id: report.tool_run_id,
                 exit_status: report.exit_status,
@@ -495,6 +812,7 @@ impl KernelRuntime {
 
             self.append_event(
                 session_id,
+                branch_id,
                 EventKind::FileMutated {
                     path: path.to_owned(),
                     content_hash,
@@ -515,7 +833,8 @@ impl KernelRuntime {
 
         let observation = extract_observation(&EventRecord::new(
             session_id,
-            self.peek_last_sequence(session_id)?,
+            branch_id.clone(),
+            self.peek_last_sequence(session_id, branch_id)?,
             EventKind::ToolCallCompleted {
                 tool_run_id: report.tool_run_id,
                 exit_status: report.exit_status,
@@ -530,6 +849,7 @@ impl KernelRuntime {
                 .context("failed appending auto observation")?;
             self.append_event(
                 session_id,
+                branch_id,
                 EventKind::ObservationExtracted {
                     observation_id: observation.observation_id,
                 },
@@ -541,34 +861,160 @@ impl KernelRuntime {
         Ok(emitted)
     }
 
-    async fn emit_phase(&self, session_id: SessionId, phase: LoopPhase) -> Result<u64> {
-        self.append_event(session_id, EventKind::PhaseEntered { phase })
+    async fn emit_phase(
+        &self,
+        session_id: SessionId,
+        branch_id: &BranchId,
+        phase: LoopPhase,
+    ) -> Result<u64> {
+        self.append_event(session_id, branch_id, EventKind::PhaseEntered { phase })
             .await?;
         Ok(1)
     }
 
-    async fn append_event(&self, session_id: SessionId, kind: EventKind) -> Result<()> {
-        let sequence = self.next_sequence(session_id)?;
-        let event = EventRecord::new(session_id, sequence, kind);
-        self.journal.append_and_publish(event).await
+    async fn append_event(
+        &self,
+        session_id: SessionId,
+        branch_id: &BranchId,
+        kind: EventKind,
+    ) -> Result<()> {
+        let event_kind = event_kind_name(&kind);
+        let sequence = self.next_sequence(session_id, branch_id)?;
+        debug!(
+            session_id = %session_id.0,
+            branch = %branch_id.as_str(),
+            sequence,
+            event_kind,
+            "appending event"
+        );
+        let event = EventRecord::new(session_id, branch_id.clone(), sequence, kind);
+        if let Err(append_error) = self.journal.append_and_publish(event).await {
+            if let Err(resync_error) = self.resync_next_sequence(session_id, branch_id).await {
+                warn!(
+                    session_id = %session_id.0,
+                    branch = %branch_id.as_str(),
+                    error = %append_error,
+                    resync_error = %resync_error,
+                    "event append failed and sequence resync failed"
+                );
+                return Err(append_error).context(format!(
+                    "failed appending event and failed sequence resync: {resync_error}"
+                ));
+            }
+            warn!(
+                session_id = %session_id.0,
+                branch = %branch_id.as_str(),
+                error = %append_error,
+                "event append failed; sequence resynced"
+            );
+            return Err(append_error).context("failed appending event; sequence was resynced");
+        }
+        self.mark_branch_head(session_id, branch_id, sequence)?;
+        Ok(())
     }
 
-    fn next_sequence(&self, session_id: SessionId) -> Result<u64> {
+    fn next_sequence(&self, session_id: SessionId, branch_id: &BranchId) -> Result<u64> {
         let mut sessions = self.sessions.lock();
         let session = sessions
             .get_mut(&session_id)
             .with_context(|| format!("session not found: {}", session_id.0))?;
-        let sequence = session.next_sequence;
-        session.next_sequence += 1;
+        if !session.branches.contains_key(branch_id) {
+            bail!("branch not found: {}", branch_id.as_str());
+        }
+        if let Some(merged_into) = session
+            .branches
+            .get(branch_id)
+            .and_then(|branch| branch.merged_into.as_ref())
+        {
+            bail!(
+                "branch {} is merged into {} and is read-only",
+                branch_id.as_str(),
+                merged_into.as_str()
+            );
+        }
+        let sequence = *session
+            .next_sequence_by_branch
+            .entry(branch_id.clone())
+            .or_insert(1);
+        session
+            .next_sequence_by_branch
+            .insert(branch_id.clone(), sequence.saturating_add(1));
         Ok(sequence)
     }
 
-    fn peek_last_sequence(&self, session_id: SessionId) -> Result<u64> {
+    fn peek_last_sequence(&self, session_id: SessionId, branch_id: &BranchId) -> Result<u64> {
         let sessions = self.sessions.lock();
         let session = sessions
             .get(&session_id)
             .with_context(|| format!("session not found: {}", session_id.0))?;
-        Ok(session.next_sequence.saturating_sub(1))
+        if !session.branches.contains_key(branch_id) {
+            bail!("branch not found: {}", branch_id.as_str());
+        }
+        Ok(session
+            .next_sequence_by_branch
+            .get(branch_id)
+            .copied()
+            .unwrap_or(1)
+            .saturating_sub(1))
+    }
+
+    async fn resync_next_sequence(
+        &self,
+        session_id: SessionId,
+        branch_id: &BranchId,
+    ) -> Result<()> {
+        let latest = self
+            .journal
+            .latest_sequence(session_id, Some(branch_id.clone()))
+            .await
+            .context("failed loading latest sequence for resync")?;
+        let mut sessions = self.sessions.lock();
+        let session = sessions
+            .get_mut(&session_id)
+            .with_context(|| format!("session not found: {}", session_id.0))?;
+        if !session.branches.contains_key(branch_id) {
+            bail!("branch not found: {}", branch_id.as_str());
+        }
+        session
+            .next_sequence_by_branch
+            .insert(branch_id.clone(), latest.saturating_add(1));
+        Ok(())
+    }
+
+    fn mark_branch_head(
+        &self,
+        session_id: SessionId,
+        branch_id: &BranchId,
+        sequence: u64,
+    ) -> Result<()> {
+        let mut sessions = self.sessions.lock();
+        let session = sessions
+            .get_mut(&session_id)
+            .with_context(|| format!("session not found: {}", session_id.0))?;
+        let branch = session
+            .branches
+            .get_mut(branch_id)
+            .with_context(|| format!("branch not found: {}", branch_id.as_str()))?;
+        branch.head_sequence = branch.head_sequence.max(sequence);
+        Ok(())
+    }
+
+    fn branch_info(&self, session_id: SessionId, branch_id: &BranchId) -> Result<BranchInfo> {
+        let sessions = self.sessions.lock();
+        let session = sessions
+            .get(&session_id)
+            .with_context(|| format!("session not found: {}", session_id.0))?;
+        let state = session
+            .branches
+            .get(branch_id)
+            .with_context(|| format!("branch not found: {}", branch_id.as_str()))?;
+        Ok(BranchInfo {
+            branch_id: branch_id.clone(),
+            parent_branch: state.parent_branch.clone(),
+            fork_sequence: state.fork_sequence,
+            head_sequence: state.head_sequence,
+            merged_into: state.merged_into.clone(),
+        })
     }
 
     fn should_checkpoint(&self, session_id: SessionId) -> Result<bool> {
@@ -583,6 +1029,7 @@ impl KernelRuntime {
     async fn create_checkpoint(
         &self,
         session_id: SessionId,
+        branch_id: &BranchId,
         manifest: &SessionManifest,
         state: &AgentStateVector,
     ) -> Result<CheckpointManifest> {
@@ -591,8 +1038,9 @@ impl KernelRuntime {
         let checkpoint = CheckpointManifest {
             checkpoint_id,
             session_id,
+            branch_id: branch_id.clone(),
             created_at: Utc::now(),
-            event_sequence: self.peek_last_sequence(session_id)?,
+            event_sequence: self.peek_last_sequence(session_id, branch_id)?,
             state_hash,
             note: "automatic heartbeat checkpoint".to_owned(),
         };
@@ -650,6 +1098,7 @@ impl KernelRuntime {
     async fn current_tick_output(
         &self,
         session_id: SessionId,
+        branch_id: &BranchId,
         mode: OperatingMode,
         state: AgentStateVector,
         events_emitted: u64,
@@ -659,7 +1108,7 @@ impl KernelRuntime {
             mode,
             state,
             events_emitted,
-            last_sequence: self.peek_last_sequence(session_id)?,
+            last_sequence: self.peek_last_sequence(session_id, branch_id)?,
         })
     }
 
@@ -734,6 +1183,34 @@ fn sha256_json<T: Serialize>(value: &T) -> Result<String> {
 fn sha256_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex::encode(digest)
+}
+
+fn event_kind_name(kind: &EventKind) -> &'static str {
+    match kind {
+        EventKind::SessionCreated { .. } => "session_created",
+        EventKind::BranchCreated { .. } => "branch_created",
+        EventKind::BranchMerged { .. } => "branch_merged",
+        EventKind::PhaseEntered { .. } => "phase_entered",
+        EventKind::DeliberationProposed { .. } => "deliberation_proposed",
+        EventKind::ApprovalRequested { .. } => "approval_requested",
+        EventKind::ApprovalResolved { .. } => "approval_resolved",
+        EventKind::ToolCallRequested { .. } => "tool_call_requested",
+        EventKind::ToolCallStarted { .. } => "tool_call_started",
+        EventKind::ToolCallCompleted { .. } => "tool_call_completed",
+        EventKind::VoiceSessionStarted { .. } => "voice_session_started",
+        EventKind::VoiceInputChunk { .. } => "voice_input_chunk",
+        EventKind::VoiceOutputChunk { .. } => "voice_output_chunk",
+        EventKind::VoiceSessionStopped { .. } => "voice_session_stopped",
+        EventKind::VoiceAdapterError { .. } => "voice_adapter_error",
+        EventKind::FileMutated { .. } => "file_mutated",
+        EventKind::ObservationExtracted { .. } => "observation_extracted",
+        EventKind::Heartbeat { .. } => "heartbeat",
+        EventKind::CheckpointCreated { .. } => "checkpoint_created",
+        EventKind::StateEstimated { .. } => "state_estimated",
+        EventKind::BudgetUpdated { .. } => "budget_updated",
+        EventKind::CircuitBreakerTripped { .. } => "circuit_breaker_tripped",
+        EventKind::ErrorRaised { .. } => "error_raised",
+    }
 }
 
 #[allow(dead_code)]

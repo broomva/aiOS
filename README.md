@@ -32,6 +32,9 @@ Core endpoints:
 - `GET /docs` (Scalar interactive docs)
 - `POST /sessions`
 - `POST /sessions/{session_id}/ticks`
+- `POST /sessions/{session_id}/branches`
+- `GET /sessions/{session_id}/branches`
+- `POST /sessions/{session_id}/branches/{branch_id}/merge`
 - `GET /sessions/{session_id}/events`
 - `GET /sessions/{session_id}/events/stream?cursor=0` (SSE replay + live tail)
 - `GET /sessions/{session_id}/events/stream/vercel-ai-sdk-v6?cursor=0` (Vercel AI SDK v6 UIMessage stream protocol)

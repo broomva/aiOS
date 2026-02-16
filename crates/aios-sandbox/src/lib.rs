@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
+use tracing::{debug, instrument, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxLimits {
@@ -75,6 +76,14 @@ impl LocalSandboxRunner {
 
 #[async_trait]
 impl SandboxRunner for LocalSandboxRunner {
+    #[instrument(
+        skip(self, request),
+        fields(
+            command = %request.command,
+            args_count = request.args.len(),
+            cwd = %request.cwd.display()
+        )
+    )]
     async fn run(&self, request: SandboxRequest) -> Result<SandboxExecution> {
         if !self.command_allowed(&request.command) {
             bail!("command not allowed in sandbox: {}", request.command);
@@ -97,7 +106,7 @@ impl SandboxRunner for LocalSandboxRunner {
                 let ended_at = Utc::now();
                 let stdout = Self::truncate(output.stdout, request.limits.max_output_bytes);
                 let stderr = Self::truncate(output.stderr, request.limits.max_output_bytes);
-                Ok(SandboxExecution {
+                let execution = SandboxExecution {
                     started_at,
                     ended_at,
                     duration_ms: (ended_at - started_at).num_milliseconds(),
@@ -105,10 +114,20 @@ impl SandboxRunner for LocalSandboxRunner {
                     stdout,
                     stderr,
                     timed_out: false,
-                })
+                };
+                debug!(
+                    exit_code = execution.exit_code,
+                    duration_ms = execution.duration_ms,
+                    "sandbox command finished"
+                );
+                Ok(execution)
             }
             Err(_) => {
                 let ended_at = Utc::now();
+                warn!(
+                    max_runtime_secs = request.limits.max_runtime_secs,
+                    "sandbox command timed out"
+                );
                 Ok(SandboxExecution {
                     started_at,
                     ended_at,

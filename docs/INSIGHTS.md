@@ -10,6 +10,10 @@ Track design ideas, operational learnings, and architectural insights.
 4. Keeping tool side effects behind capability + sandbox boundaries is essential for trustworthy automation.
 5. Reusing one OpenAPI live-validation script across CI and pre-push hooks prevents contract drift between local and hosted checks.
 6. "Optimal filesystem" for agents is a layered substrate (journal + blob CAS + manifest projection + workspace view), not a single host FS choice.
+7. Stream correctness depends on strict sequence invariants plus gap backfill; live broadcast alone is insufficient under lag.
+8. Branch-scoped sequencing is required for safe multi-path exploration; global per-session sequence counters hide branch correctness bugs.
+9. Branch lifecycle needs explicit guards (fork bounds, merge-source constraints, and merged-branch read-only rules) to keep replay behavior predictable.
+10. Distributed tracing only becomes actionable when spans cross boundaries (kernel -> runtime -> tool dispatcher -> sandbox -> event store), not when scoped to HTTP alone.
 
 ## Working Ideas
 

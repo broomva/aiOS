@@ -21,7 +21,9 @@ Build and operate `aiOS` as a safe, event-native, session-oriented agent operati
 3. Keep event provenance and auditability intact:
 - Emit events for meaningful transitions.
 - Preserve monotonic sequence per session.
+- Preserve monotonic sequence per branch.
 - Keep artifacts traceable to event history.
+- Enforce branch lifecycle invariants (bounded fork sequence, merged branches read-only, `main` not used as merge source).
 
 4. Enforce quality gate before completion:
 - `cargo fmt --all --check`
