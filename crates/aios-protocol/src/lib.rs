@@ -31,12 +31,12 @@ pub mod tool;
 // Re-export the most commonly used types at the crate root.
 pub use error::{KernelError, KernelResult};
 pub use event::{
-    ApprovalDecision, EventEnvelope, EventKind, EventRecord, LoopPhase, PolicyDecisionKind,
-    RiskLevel, SnapshotType, SpanStatus, TokenUsage,
+    ActorType, ApprovalDecision, EventActor, EventEnvelope, EventKind, EventRecord, EventSchema,
+    LoopPhase, PolicyDecisionKind, RiskLevel, SnapshotType, SpanStatus, TokenUsage,
 };
 pub use ids::{
-    ApprovalId, BlobHash, BranchId, CheckpointId, EventId, MemoryId, RunId, SeqNo, SessionId,
-    SnapshotId, ToolRunId,
+    AgentId, ApprovalId, BlobHash, BranchId, CheckpointId, EventId, MemoryId, RunId, SeqNo,
+    SessionId, SnapshotId, ToolRunId,
 };
 pub use memory::{FileProvenance, MemoryScope, Observation, Provenance, SoulProfile};
 pub use mode::{GatingProfile, OperatingMode};
@@ -44,5 +44,8 @@ pub use policy::{Capability, PolicyEvaluation, PolicySet};
 pub use session::{
     BranchInfo, BranchMergeResult, CheckpointManifest, ModelRouting, SessionManifest,
 };
-pub use state::{AgentStateVector, BudgetState};
+pub use state::{
+    AgentStateVector, BlobRef, BudgetState, CanonicalState, MemoryNamespace, PatchApplyError,
+    PatchOp, ProvenanceRef, StatePatch, VersionedCanonicalState,
+};
 pub use tool::{ToolCall, ToolOutcome};

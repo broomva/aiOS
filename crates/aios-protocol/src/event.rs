@@ -11,9 +11,56 @@
 use crate::ids::*;
 use crate::memory::MemoryScope;
 use crate::mode::OperatingMode;
-use crate::state::{AgentStateVector, BudgetState};
+use crate::state::{AgentStateVector, BudgetState, StatePatch};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Event actor identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorType {
+    User,
+    Agent,
+    System,
+}
+
+/// Event actor metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventActor {
+    #[serde(rename = "type")]
+    pub actor_type: ActorType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+}
+
+impl Default for EventActor {
+    fn default() -> Self {
+        Self {
+            actor_type: ActorType::System,
+            component: Some("arcan-daemon".to_owned()),
+        }
+    }
+}
+
+/// Event schema descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventSchema {
+    pub name: String,
+    pub version: String,
+}
+
+impl Default for EventSchema {
+    fn default() -> Self {
+        Self {
+            name: "aios-protocol".to_owned(),
+            version: "0.1.0".to_owned(),
+        }
+    }
+}
+
+fn default_agent_id() -> AgentId {
+    AgentId::default()
+}
 
 /// The universal state-change envelope for the Agent OS.
 ///
@@ -23,14 +70,28 @@ use std::collections::HashMap;
 pub struct EventEnvelope {
     pub event_id: EventId,
     pub session_id: SessionId,
+    #[serde(default = "default_agent_id")]
+    pub agent_id: AgentId,
     pub branch_id: BranchId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
     pub seq: SeqNo,
     /// Microseconds since UNIX epoch.
+    #[serde(rename = "ts_ms", alias = "timestamp")]
     pub timestamp: u64,
+    #[serde(default)]
+    pub actor: EventActor,
+    #[serde(default)]
+    pub schema: EventSchema,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "parent_event_id", alias = "parent_id")]
     pub parent_id: Option<EventId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     pub kind: EventKind,
     #[serde(default)]
     pub metadata: HashMap<String, String>,
@@ -60,13 +121,25 @@ impl EventEnvelope {
 pub struct EventRecord {
     pub event_id: EventId,
     pub session_id: SessionId,
+    #[serde(default = "default_agent_id")]
+    pub agent_id: AgentId,
     pub branch_id: BranchId,
     pub sequence: SeqNo,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub actor: EventActor,
+    #[serde(default)]
+    pub schema: EventSchema,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub causation_id: Option<EventId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
     pub kind: EventKind,
 }
 
@@ -81,11 +154,17 @@ impl EventRecord {
         Self {
             event_id: EventId::default(),
             session_id,
+            agent_id: AgentId::default(),
             branch_id,
             sequence,
             timestamp: chrono::Utc::now(),
+            actor: EventActor::default(),
+            schema: EventSchema::default(),
             causation_id: None,
             correlation_id: None,
+            trace_id: None,
+            span_id: None,
+            digest: None,
             kind,
         }
     }
@@ -95,11 +174,17 @@ impl EventRecord {
         EventEnvelope {
             event_id: self.event_id.clone(),
             session_id: self.session_id.clone(),
+            agent_id: self.agent_id.clone(),
             branch_id: self.branch_id.clone(),
             run_id: None,
             seq: self.sequence,
             timestamp: self.timestamp.timestamp_micros() as u64,
+            actor: self.actor.clone(),
+            schema: self.schema.clone(),
             parent_id: self.causation_id.clone(),
+            trace_id: self.trace_id.clone(),
+            span_id: self.span_id.clone(),
+            digest: self.digest.clone(),
             kind: self.kind.clone(),
             metadata: HashMap::new(),
             schema_version: 1,
@@ -119,6 +204,15 @@ impl EventRecord {
 #[non_exhaustive]
 #[serde(tag = "type")]
 pub enum EventKind {
+    // ── Input / sensing ──
+    UserMessage {
+        content: String,
+    },
+    ExternalSignal {
+        signal_type: String,
+        data: serde_json::Value,
+    },
+
     // ── Session lifecycle ──
     SessionCreated {
         name: String,
@@ -181,6 +275,19 @@ pub enum EventKind {
     },
 
     // ── Text streaming (from Arcan + Lago) ──
+    AssistantTextDelta {
+        delta: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        index: Option<u32>,
+    },
+    AssistantMessageCommitted {
+        role: String,
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_usage: Option<TokenUsage>,
+    },
     TextDelta {
         delta: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -243,6 +350,10 @@ pub enum EventKind {
     },
 
     // ── State management (from Lago + Arcan) ──
+    StatePatchCommitted {
+        new_version: u64,
+        patch: StatePatch,
+    },
     StatePatched {
         #[serde(skip_serializing_if = "Option::is_none")]
         index: Option<u32>,
@@ -434,6 +545,16 @@ pub enum EventKind {
         #[serde(default)]
         reasons: Vec<String>,
     },
+    IntentApproved {
+        intent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<String>,
+    },
+    IntentRejected {
+        intent_id: String,
+        #[serde(default)]
+        reasons: Vec<String>,
+    },
 
     // ── Error ──
     ErrorRaised {
@@ -526,6 +647,13 @@ pub enum PolicyDecisionKind {
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 enum EventKindKnown {
+    UserMessage {
+        content: String,
+    },
+    ExternalSignal {
+        signal_type: String,
+        data: serde_json::Value,
+    },
     SessionCreated {
         name: String,
         config: serde_json::Value,
@@ -576,6 +704,19 @@ enum EventKindKnown {
         index: u32,
         stop_reason: String,
         directive_count: usize,
+    },
+    AssistantTextDelta {
+        delta: String,
+        #[serde(default)]
+        index: Option<u32>,
+    },
+    AssistantMessageCommitted {
+        role: String,
+        content: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        token_usage: Option<TokenUsage>,
     },
     TextDelta {
         delta: String,
@@ -638,6 +779,10 @@ enum EventKindKnown {
         index: Option<u32>,
         patch: serde_json::Value,
         revision: u64,
+    },
+    StatePatchCommitted {
+        new_version: u64,
+        patch: StatePatch,
     },
     ContextCompacted {
         dropped_count: usize,
@@ -804,6 +949,16 @@ enum EventKindKnown {
         #[serde(default)]
         reasons: Vec<String>,
     },
+    IntentApproved {
+        intent_id: String,
+        #[serde(default)]
+        actor: Option<String>,
+    },
+    IntentRejected {
+        intent_id: String,
+        #[serde(default)]
+        reasons: Vec<String>,
+    },
     ErrorRaised {
         message: String,
     },
@@ -844,6 +999,10 @@ impl From<EventKindKnown> for EventKind {
     #[allow(clippy::too_many_lines)]
     fn from(k: EventKindKnown) -> Self {
         match k {
+            EventKindKnown::UserMessage { content } => Self::UserMessage { content },
+            EventKindKnown::ExternalSignal { signal_type, data } => {
+                Self::ExternalSignal { signal_type, data }
+            }
             EventKindKnown::SessionCreated { name, config } => {
                 Self::SessionCreated { name, config }
             }
@@ -903,6 +1062,20 @@ impl From<EventKindKnown> for EventKind {
                 index,
                 stop_reason,
                 directive_count,
+            },
+            EventKindKnown::AssistantTextDelta { delta, index } => {
+                Self::AssistantTextDelta { delta, index }
+            }
+            EventKindKnown::AssistantMessageCommitted {
+                role,
+                content,
+                model,
+                token_usage,
+            } => Self::AssistantMessageCommitted {
+                role,
+                content,
+                model,
+                token_usage,
             },
             EventKindKnown::TextDelta { delta, index } => Self::TextDelta { delta, index },
             EventKindKnown::Message {
@@ -985,6 +1158,9 @@ impl From<EventKindKnown> for EventKind {
                 patch,
                 revision,
             },
+            EventKindKnown::StatePatchCommitted { new_version, patch } => {
+                Self::StatePatchCommitted { new_version, patch }
+            }
             EventKindKnown::ContextCompacted {
                 dropped_count,
                 tokens_before,
@@ -1236,6 +1412,12 @@ impl From<EventKindKnown> for EventKind {
                 requires_approval,
                 reasons,
             },
+            EventKindKnown::IntentApproved { intent_id, actor } => {
+                Self::IntentApproved { intent_id, actor }
+            }
+            EventKindKnown::IntentRejected { intent_id, reasons } => {
+                Self::IntentRejected { intent_id, reasons }
+            }
             EventKindKnown::ErrorRaised { message } => Self::ErrorRaised { message },
             EventKindKnown::Custom { event_type, data } => Self::Custom { event_type, data },
         }
@@ -1250,11 +1432,17 @@ mod tests {
         EventEnvelope {
             event_id: EventId::from_string("EVT001"),
             session_id: SessionId::from_string("SESS001"),
+            agent_id: AgentId::from_string("AGENT001"),
             branch_id: BranchId::from_string("main"),
             run_id: None,
             seq: 1,
             timestamp: 1_700_000_000_000_000,
+            actor: EventActor::default(),
+            schema: EventSchema::default(),
             parent_id: None,
+            trace_id: None,
+            span_id: None,
+            digest: None,
             kind,
             metadata: HashMap::new(),
             schema_version: 1,

@@ -68,6 +68,10 @@ typed_id!(
     EventId
 );
 typed_id!(
+    /// Unique identifier for an agent identity.
+    AgentId
+);
+typed_id!(
     /// Unique identifier for a session.
     SessionId
 );
