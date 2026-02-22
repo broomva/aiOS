@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aios_protocol::{BranchId, EventRecord, SessionId};
+use aios_protocol::{
+    BranchId, EventRecord, EventRecordStream, EventStorePort, KernelError, SessionId,
+};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -11,6 +13,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, instrument, warn};
+
+fn to_kernel_error(error: anyhow::Error) -> KernelError {
+    KernelError::Runtime(error.to_string())
+}
 
 #[async_trait]
 pub trait EventStore: Send + Sync {
@@ -307,6 +313,87 @@ impl EventJournal {
 
     pub fn subscribe(&self) -> broadcast::Receiver<EventRecord> {
         self.stream.subscribe()
+    }
+}
+
+#[async_trait]
+impl EventStorePort for EventJournal {
+    async fn append(&self, event: EventRecord) -> std::result::Result<EventRecord, KernelError> {
+        self.append_and_publish(event.clone())
+            .await
+            .map_err(to_kernel_error)?;
+        Ok(event)
+    }
+
+    async fn read(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        from_sequence: u64,
+        limit: usize,
+    ) -> std::result::Result<Vec<EventRecord>, KernelError> {
+        self.read_from(session_id, Some(branch_id), from_sequence, limit)
+            .await
+            .map_err(to_kernel_error)
+    }
+
+    async fn head(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+    ) -> std::result::Result<u64, KernelError> {
+        self.latest_sequence(session_id, Some(branch_id))
+            .await
+            .map_err(to_kernel_error)
+    }
+
+    async fn subscribe(
+        &self,
+        session_id: SessionId,
+        branch_id: BranchId,
+        after_sequence: u64,
+    ) -> std::result::Result<EventRecordStream, KernelError> {
+        // Replay a bounded prefix to support resume semantics before tailing.
+        let replay = self
+            .read_from(
+                session_id.clone(),
+                Some(branch_id.clone()),
+                after_sequence.saturating_add(1),
+                10_000,
+            )
+            .await
+            .map_err(to_kernel_error)?;
+
+        let mut receiver = EventJournal::subscribe(self);
+        let stream = async_stream::try_stream! {
+            for event in replay {
+                if event.session_id == session_id
+                    && event.branch_id == branch_id
+                    && event.sequence > after_sequence
+                {
+                    yield event;
+                }
+            }
+
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => {
+                        if event.session_id == session_id
+                            && event.branch_id == branch_id
+                            && event.sequence > after_sequence
+                        {
+                            yield event;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "event subscription lagged; dropping stale frames");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        };
+
+        Ok(Box::pin(stream))
     }
 }
 

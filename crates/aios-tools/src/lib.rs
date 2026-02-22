@@ -3,9 +3,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aios_policy::{PolicyEngine, PolicyEvaluation};
+use aios_protocol::KernelError;
 use aios_protocol::{Capability, SessionId, ToolCall, ToolOutcome, ToolRunId};
+use aios_protocol::{
+    ToolExecutionReport as PortToolExecutionReport, ToolExecutionRequest, ToolHarnessPort,
+};
 use aios_sandbox::{SandboxLimits, SandboxRequest, SandboxRunner};
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::fs;
@@ -308,4 +313,37 @@ fn canonical_session_path(root: &Path, relative_path: &str) -> Result<PathBuf> {
     }
 
     Ok(candidate)
+}
+
+fn to_kernel_error(error: anyhow::Error) -> KernelError {
+    KernelError::Runtime(error.to_string())
+}
+
+#[async_trait]
+impl ToolHarnessPort for ToolDispatcher {
+    async fn execute(
+        &self,
+        request: ToolExecutionRequest,
+    ) -> std::result::Result<PortToolExecutionReport, KernelError> {
+        let context = ToolContext {
+            workspace_root: PathBuf::from(&request.workspace_root),
+        };
+        match self
+            .dispatch(request.session_id, &context, request.call.clone())
+            .await
+            .map_err(to_kernel_error)?
+        {
+            DispatchResult::Executed(report) => Ok(PortToolExecutionReport {
+                tool_run_id: report.tool_run_id,
+                call_id: request.call.call_id,
+                tool_name: report.tool_name,
+                exit_status: report.exit_status,
+                duration_ms: 0,
+                outcome: report.outcome,
+            }),
+            DispatchResult::NeedsApproval { tool_name, .. } => Err(KernelError::ApprovalRequired(
+                format!("tool execution requires approval: {tool_name}"),
+            )),
+        }
+    }
 }

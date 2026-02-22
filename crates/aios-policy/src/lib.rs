@@ -1,8 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aios_protocol::{Capability, PolicySet, SessionId};
+use aios_protocol::{
+    ApprovalId, ApprovalPort, ApprovalRequest, ApprovalResolution as PortApprovalResolution,
+    ApprovalTicket as PortApprovalTicket, Capability, KernelError, PolicyGateDecision,
+    PolicyGatePort, PolicySet, SessionId,
+};
 use async_trait::async_trait;
+use chrono::Utc;
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -25,6 +30,8 @@ impl PolicyEvaluation {
 pub struct ApprovalTicket {
     pub approval_id: Uuid,
     pub session_id: SessionId,
+    pub call_id: Option<String>,
+    pub tool_name: Option<String>,
     pub capability: Capability,
     pub reason: String,
 }
@@ -158,16 +165,20 @@ pub struct ApprovalQueue {
 }
 
 impl ApprovalQueue {
-    pub async fn enqueue(
+    pub async fn enqueue_with_context(
         &self,
         session_id: SessionId,
         capability: Capability,
         reason: impl Into<String>,
+        call_id: Option<String>,
+        tool_name: Option<String>,
     ) -> ApprovalTicket {
         let approval_id = Uuid::new_v4();
         let ticket = ApprovalTicket {
             approval_id,
             session_id,
+            call_id,
+            tool_name,
             capability,
             reason: reason.into(),
         };
@@ -176,6 +187,16 @@ impl ApprovalQueue {
             .await
             .insert(approval_id, ticket.clone());
         ticket
+    }
+
+    pub async fn enqueue(
+        &self,
+        session_id: SessionId,
+        capability: Capability,
+        reason: impl Into<String>,
+    ) -> ApprovalTicket {
+        self.enqueue_with_context(session_id, capability, reason, None, None)
+            .await
     }
 
     pub async fn resolve(
@@ -211,6 +232,98 @@ impl ApprovalQueue {
 
     pub async fn resolution(&self, approval_id: Uuid) -> Option<ApprovalResolution> {
         self.resolved.read().await.get(&approval_id).cloned()
+    }
+}
+
+#[async_trait]
+impl PolicyGatePort for SessionPolicyEngine {
+    async fn evaluate(
+        &self,
+        session_id: SessionId,
+        requested: Vec<Capability>,
+    ) -> std::result::Result<PolicyGateDecision, KernelError> {
+        let evaluation =
+            <Self as PolicyEngine>::evaluate_capabilities(self, session_id, &requested).await;
+        Ok(PolicyGateDecision {
+            allowed: evaluation.allowed,
+            requires_approval: evaluation.requires_approval,
+            denied: evaluation.denied,
+        })
+    }
+
+    async fn set_policy(
+        &self,
+        session_id: SessionId,
+        policy: PolicySet,
+    ) -> std::result::Result<(), KernelError> {
+        SessionPolicyEngine::set_policy(self, &session_id, &policy).await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ApprovalPort for ApprovalQueue {
+    async fn enqueue(
+        &self,
+        request: ApprovalRequest,
+    ) -> std::result::Result<PortApprovalTicket, KernelError> {
+        let ticket = self
+            .enqueue_with_context(
+                request.session_id,
+                request.capability.clone(),
+                request.reason,
+                Some(request.call_id.clone()),
+                Some(request.tool_name.clone()),
+            )
+            .await;
+
+        Ok(PortApprovalTicket {
+            approval_id: ApprovalId::from_string(ticket.approval_id.to_string()),
+            session_id: ticket.session_id,
+            call_id: request.call_id,
+            tool_name: request.tool_name,
+            capability: ticket.capability,
+            reason: ticket.reason,
+            created_at: Utc::now(),
+        })
+    }
+
+    async fn list_pending(
+        &self,
+        session_id: SessionId,
+    ) -> std::result::Result<Vec<PortApprovalTicket>, KernelError> {
+        let pending = self.pending_for_session(&session_id).await;
+        Ok(pending
+            .into_iter()
+            .map(|ticket| PortApprovalTicket {
+                approval_id: ApprovalId::from_string(ticket.approval_id.to_string()),
+                session_id: ticket.session_id,
+                call_id: ticket.call_id.unwrap_or_default(),
+                tool_name: ticket.tool_name.unwrap_or_default(),
+                capability: ticket.capability,
+                reason: ticket.reason,
+                created_at: Utc::now(),
+            })
+            .collect())
+    }
+
+    async fn resolve(
+        &self,
+        approval_id: ApprovalId,
+        approved: bool,
+        actor: String,
+    ) -> std::result::Result<PortApprovalResolution, KernelError> {
+        let parsed = Uuid::parse_str(approval_id.as_str())
+            .map_err(|error| KernelError::InvalidState(format!("invalid approval id: {error}")))?;
+        let resolution = ApprovalQueue::resolve(self, parsed, approved, actor.clone())
+            .await
+            .ok_or_else(|| KernelError::InvalidState("approval not pending".to_owned()))?;
+        Ok(PortApprovalResolution {
+            approval_id,
+            approved: resolution.approved,
+            actor,
+            resolved_at: Utc::now(),
+        })
     }
 }
 

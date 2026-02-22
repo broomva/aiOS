@@ -5,14 +5,57 @@ use aios_events::{EventJournal, EventStreamHub, FileEventStore};
 use aios_memory::WorkspaceMemoryStore;
 use aios_policy::{ApprovalQueue, SessionPolicyEngine};
 use aios_protocol::{
-    BranchId, BranchInfo, BranchMergeResult, EventKind, EventRecord, ModelRouting, PolicySet,
-    SessionId, SessionManifest, ToolCall,
+    BranchId, BranchInfo, BranchMergeResult, EventKind, EventRecord, EventStorePort, KernelResult,
+    MemoryPort, ModelCompletion, ModelCompletionRequest, ModelDirective, ModelProviderPort,
+    ModelRouting, ModelStopReason, PolicyGatePort, PolicySet, SessionId, SessionManifest,
+    TokenUsage, ToolCall, ToolHarnessPort,
 };
 use aios_runtime::{KernelRuntime, RuntimeConfig, TickInput, TickOutput};
 use aios_sandbox::LocalSandboxRunner;
 use aios_tools::{ToolDispatcher, ToolRegistry};
 use anyhow::Result;
+use async_trait::async_trait;
 use tracing::instrument;
+
+#[derive(Debug, Default)]
+struct BaselineModelProvider;
+
+#[async_trait]
+impl ModelProviderPort for BaselineModelProvider {
+    async fn complete(&self, request: ModelCompletionRequest) -> KernelResult<ModelCompletion> {
+        let mut directives = Vec::new();
+        let mut stop_reason = ModelStopReason::Completed;
+        let mut final_answer = Some(format!("objective received: {}", request.objective));
+
+        if let Some(call) = request.proposed_tool {
+            directives.push(ModelDirective::ToolCall { call });
+            stop_reason = ModelStopReason::ToolCall;
+            final_answer = None;
+        } else {
+            directives.push(ModelDirective::Message {
+                role: "assistant".to_owned(),
+                content: format!("working on: {}", request.objective),
+            });
+            directives.push(ModelDirective::TextDelta {
+                delta: " done".to_owned(),
+                index: Some(0),
+            });
+        }
+
+        Ok(ModelCompletion {
+            provider: "baseline".to_owned(),
+            model: "baseline-deterministic".to_owned(),
+            directives,
+            stop_reason,
+            usage: Some(TokenUsage {
+                prompt_tokens: 8,
+                completion_tokens: 12,
+                total_tokens: 20,
+            }),
+            final_answer,
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct KernelBuilder {
@@ -44,25 +87,31 @@ impl KernelBuilder {
         let events_root = self.root.join("kernel");
         let session_root = self.root.join("sessions");
 
-        let event_store = Arc::new(FileEventStore::new(events_root));
+        let event_store_backend = Arc::new(FileEventStore::new(events_root));
         let stream = EventStreamHub::new(1024);
-        let journal = EventJournal::new(event_store, stream);
+        let journal = Arc::new(EventJournal::new(event_store_backend, stream));
+        let event_store: Arc<dyn EventStorePort> = journal;
 
-        let approvals = ApprovalQueue::default();
+        let approvals_engine = Arc::new(ApprovalQueue::default());
+        let approvals: Arc<dyn aios_protocol::ApprovalPort> = approvals_engine;
         let policy_engine = Arc::new(SessionPolicyEngine::new(self.default_policy));
+        let policy_gate: Arc<dyn PolicyGatePort> = policy_engine.clone();
 
         let registry = Arc::new(ToolRegistry::with_core_tools());
         let sandbox = Arc::new(LocalSandboxRunner::new(self.allowed_commands));
-        let dispatcher = ToolDispatcher::new(registry, policy_engine.clone(), sandbox);
+        let dispatcher = Arc::new(ToolDispatcher::new(registry, policy_engine, sandbox));
+        let tool_harness: Arc<dyn ToolHarnessPort> = dispatcher;
 
-        let memory = Arc::new(WorkspaceMemoryStore::new(session_root));
+        let memory: Arc<dyn MemoryPort> = Arc::new(WorkspaceMemoryStore::new(session_root));
+        let provider: Arc<dyn ModelProviderPort> = Arc::new(BaselineModelProvider);
         let runtime = KernelRuntime::new(
             RuntimeConfig::new(self.root),
-            journal,
-            dispatcher,
+            event_store,
+            provider,
+            tool_harness,
             memory,
             approvals,
-            policy_engine,
+            policy_gate,
         );
 
         AiosKernel { runtime }

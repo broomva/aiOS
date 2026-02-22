@@ -9,6 +9,8 @@ authors.workspace = true
 aios-protocol = { path = "../aios-protocol" }
 anyhow.workspace = true
 async-trait.workspace = true
+async-stream.workspace = true
+futures-util.workspace = true
 parking_lot.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

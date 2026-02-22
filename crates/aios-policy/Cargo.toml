@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 aios-protocol = { path = "../aios-protocol" }
 async-trait.workspace = true
+chrono.workspace = true
 indexmap.workspace = true
 serde.workspace = true
 tokio.workspace = true

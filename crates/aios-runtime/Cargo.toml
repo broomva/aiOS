@@ -6,11 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-aios-events = { path = "../aios-events" }
-aios-memory = { path = "../aios-memory" }
 aios-protocol = { path = "../aios-protocol" }
-aios-policy = { path = "../aios-policy" }
-aios-tools = { path = "../aios-tools" }
 anyhow.workspace = true
 chrono.workspace = true
 hex.workspace = true

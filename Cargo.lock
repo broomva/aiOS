@@ -37,7 +37,9 @@ version = "0.1.0"
 dependencies = [
  "aios-protocol",
  "anyhow",
+ "async-stream",
  "async-trait",
+ "futures-util",
  "parking_lot",
  "serde_json",
  "tokio",
@@ -57,6 +59,7 @@ dependencies = [
  "aios-sandbox",
  "aios-tools",
  "anyhow",
+ "async-trait",
  "serde_json",
  "tokio",
  "tracing",
@@ -81,6 +84,7 @@ version = "0.1.0"
 dependencies = [
  "aios-protocol",
  "async-trait",
+ "chrono",
  "indexmap",
  "serde",
  "tokio",
@@ -91,7 +95,9 @@ dependencies = [
 name = "aios-protocol"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
+ "futures-util",
  "indexmap",
  "serde",
  "serde_json",
@@ -103,11 +109,7 @@ dependencies = [
 name = "aios-runtime"
 version = "0.1.0"
 dependencies = [
- "aios-events",
- "aios-memory",
- "aios-policy",
  "aios-protocol",
- "aios-tools",
  "anyhow",
  "chrono",
  "hex",

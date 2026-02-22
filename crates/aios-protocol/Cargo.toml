@@ -7,7 +7,9 @@ authors.workspace = true
 description = "Canonical Agent OS protocol — shared types, event taxonomy, and trait interfaces for all projects (Arcan, Lago, Autonomic)"
 
 [dependencies]
+async-trait.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
 indexmap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

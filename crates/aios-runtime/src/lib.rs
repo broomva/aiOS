@@ -2,22 +2,21 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aios_events::EventJournal;
-use aios_memory::{MemoryStore, extract_observation};
-use aios_policy::{ApprovalQueue, SessionPolicyEngine};
 use aios_protocol::{
-    AgentStateVector, ApprovalId, BranchId, BranchInfo, BranchMergeResult, BudgetState,
-    CheckpointId, CheckpointManifest, EventKind, EventRecord, LoopPhase, ModelRouting,
-    OperatingMode, PolicySet, RiskLevel, SessionId, SessionManifest, SpanStatus, ToolCall,
-    ToolOutcome,
+    AgentStateVector, ApprovalDecision, ApprovalId, ApprovalPort, ApprovalRequest, BranchId,
+    BranchInfo, BranchMergeResult, BudgetState, CheckpointId, CheckpointManifest, EventKind,
+    EventRecord, EventStorePort, FileProvenance, LoopPhase, MemoryPort, ModelCompletionRequest,
+    ModelDirective, ModelProviderPort, ModelRouting, OperatingMode, PolicyGatePort, PolicySet,
+    RiskLevel, RunId, SessionId, SessionManifest, SpanStatus, ToolCall, ToolExecutionReport,
+    ToolExecutionRequest, ToolHarnessPort, ToolOutcome,
 };
-use aios_tools::{DispatchResult, ToolContext, ToolDispatcher, ToolExecutionReport};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::sync::broadcast;
 use tracing::{debug, info, instrument, warn};
 
 #[derive(Debug, Clone)]
@@ -73,30 +72,36 @@ struct BranchRuntimeState {
 #[derive(Clone)]
 pub struct KernelRuntime {
     config: RuntimeConfig,
-    journal: EventJournal,
-    dispatcher: ToolDispatcher,
-    memory: Arc<dyn MemoryStore>,
-    approvals: ApprovalQueue,
-    session_policy: Arc<SessionPolicyEngine>,
+    event_store: Arc<dyn EventStorePort>,
+    provider: Arc<dyn ModelProviderPort>,
+    tool_harness: Arc<dyn ToolHarnessPort>,
+    memory: Arc<dyn MemoryPort>,
+    approvals: Arc<dyn ApprovalPort>,
+    policy_gate: Arc<dyn PolicyGatePort>,
+    stream: broadcast::Sender<EventRecord>,
     sessions: Arc<Mutex<HashMap<String, SessionRuntimeState>>>,
 }
 
 impl KernelRuntime {
     pub fn new(
         config: RuntimeConfig,
-        journal: EventJournal,
-        dispatcher: ToolDispatcher,
-        memory: Arc<dyn MemoryStore>,
-        approvals: ApprovalQueue,
-        session_policy: Arc<SessionPolicyEngine>,
+        event_store: Arc<dyn EventStorePort>,
+        provider: Arc<dyn ModelProviderPort>,
+        tool_harness: Arc<dyn ToolHarnessPort>,
+        memory: Arc<dyn MemoryPort>,
+        approvals: Arc<dyn ApprovalPort>,
+        policy_gate: Arc<dyn PolicyGatePort>,
     ) -> Self {
+        let (stream, _) = broadcast::channel(2048);
         Self {
             config,
-            journal,
-            dispatcher,
+            event_store,
+            provider,
+            tool_harness,
             memory,
             approvals,
-            session_policy,
+            policy_gate,
+            stream,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -108,7 +113,22 @@ impl KernelRuntime {
         policy: PolicySet,
         model_routing: ModelRouting,
     ) -> Result<SessionManifest> {
-        let session_id = SessionId::default();
+        self.create_session_with_id(SessionId::default(), owner, policy, model_routing)
+            .await
+    }
+
+    #[instrument(skip(self, owner, policy, model_routing), fields(session_id = %session_id))]
+    pub async fn create_session_with_id(
+        &self,
+        session_id: SessionId,
+        owner: impl Into<String>,
+        policy: PolicySet,
+        model_routing: ModelRouting,
+    ) -> Result<SessionManifest> {
+        if let Some(existing) = self.sessions.lock().get(session_id.as_str()) {
+            return Ok(existing.manifest.clone());
+        }
+
         let owner = owner.into();
         let session_root = self.session_root(&session_id);
         self.initialize_workspace(session_root.as_path()).await?;
@@ -129,8 +149,8 @@ impl KernelRuntime {
 
         let main_branch = BranchId::main();
         let latest_sequence = self
-            .journal
-            .latest_sequence(session_id.clone(), Some(main_branch.clone()))
+            .event_store
+            .head(session_id.clone(), main_branch.clone())
             .await
             .unwrap_or(0);
         let mut next_sequence_by_branch = HashMap::new();
@@ -156,28 +176,44 @@ impl KernelRuntime {
                 state_vector: AgentStateVector::default(),
             },
         );
-        self.session_policy.set_policy(&session_id, &policy).await;
+        self.policy_gate
+            .set_policy(session_id.clone(), policy)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
-        self.append_event(
-            &session_id,
-            &main_branch,
-            EventKind::SessionCreated {
-                name: manifest_hash.clone(),
-                config: serde_json::json!({ "manifest_hash": manifest_hash }),
-            },
-        )
-        .await?;
-
-        self.emit_phase(&session_id, &main_branch, LoopPhase::Sleep)
+        if latest_sequence == 0 {
+            self.append_event(
+                &session_id,
+                &main_branch,
+                EventKind::SessionCreated {
+                    name: manifest_hash.clone(),
+                    config: serde_json::json!({ "manifest_hash": manifest_hash }),
+                },
+            )
             .await?;
 
-        info!(
-            session_id = %session_id,
-            workspace_root = %manifest.workspace_root,
-            "session created"
-        );
+            self.emit_phase(&session_id, &main_branch, LoopPhase::Sleep)
+                .await?;
+
+            info!(
+                session_id = %session_id,
+                workspace_root = %manifest.workspace_root,
+                "session created"
+            );
+        } else {
+            info!(
+                session_id = %session_id,
+                workspace_root = %manifest.workspace_root,
+                latest_sequence,
+                "session attached to existing event stream"
+            );
+        }
 
         Ok(manifest)
+    }
+
+    pub fn session_exists(&self, session_id: &SessionId) -> bool {
+        self.sessions.lock().contains_key(session_id.as_str())
     }
 
     pub async fn tick(&self, session_id: &SessionId, input: TickInput) -> Result<TickOutput> {
@@ -228,7 +264,11 @@ impl KernelRuntime {
         .await?;
         emitted += 1;
 
-        let pending_approvals = self.approvals.pending_for_session(session_id).await;
+        let pending_approvals = self
+            .approvals
+            .list_pending(session_id.clone())
+            .await
+            .unwrap_or_default();
         let mut mode = self.estimate_mode(&state, pending_approvals.len());
 
         self.append_event(
@@ -252,99 +292,255 @@ impl KernelRuntime {
                 .await;
         }
 
-        if let Some(call) = input.proposed_tool {
-            emitted += self
-                .emit_phase(session_id, branch_id, LoopPhase::Gate)
-                .await?;
-            self.append_event(
-                session_id,
-                branch_id,
-                EventKind::ToolCallRequested {
-                    call_id: call.call_id.clone(),
-                    tool_name: call.tool_name.clone(),
-                    arguments: call.input.clone(),
-                    category: None,
-                },
-            )
+        let run_id = RunId::default();
+        self.append_event(
+            session_id,
+            branch_id,
+            EventKind::RunStarted {
+                provider: "canonical".to_owned(),
+                max_iterations: 1,
+            },
+        )
+        .await?;
+        emitted += 1;
+        self.append_event(session_id, branch_id, EventKind::StepStarted { index: 0 })
             .await?;
-            emitted += 1;
+        emitted += 1;
 
-            let context = ToolContext {
-                workspace_root: PathBuf::from(&manifest.workspace_root),
-            };
-
-            match self
-                .dispatcher
-                .dispatch(session_id.clone(), &context, call.clone())
+        let completion = if let Some(call) = input.proposed_tool.clone() {
+            Ok(aios_protocol::ModelCompletion {
+                provider: "inline-proposed-tool".to_owned(),
+                model: "inline".to_owned(),
+                directives: vec![ModelDirective::ToolCall { call }],
+                stop_reason: aios_protocol::ModelStopReason::ToolCall,
+                usage: None,
+                final_answer: None,
+            })
+        } else {
+            self.provider
+                .complete(ModelCompletionRequest {
+                    session_id: session_id.clone(),
+                    branch_id: branch_id.clone(),
+                    run_id: run_id.clone(),
+                    step_index: 0,
+                    objective: input.objective.clone(),
+                    proposed_tool: None,
+                })
                 .await
-            {
-                Ok(DispatchResult::NeedsApproval { evaluation, .. }) => {
-                    mode = OperatingMode::AskHuman;
-                    info!(
-                        approval_count = evaluation.requires_approval.len(),
-                        "tool execution requires approval"
-                    );
-                    for capability in evaluation.requires_approval {
-                        let ticket = self
-                            .approvals
-                            .enqueue(
-                                session_id.clone(),
-                                capability.clone(),
-                                format!("approval required for tool {}", call.tool_name),
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+        };
+
+        match completion {
+            Ok(completion) => {
+                let mut directive_count = 0_usize;
+                for directive in completion.directives {
+                    directive_count += 1;
+                    match directive {
+                        ModelDirective::TextDelta { delta, index } => {
+                            self.append_event(
+                                session_id,
+                                branch_id,
+                                EventKind::TextDelta { delta, index },
                             )
-                            .await;
-                        self.append_event(
-                            session_id,
-                            branch_id,
-                            EventKind::ApprovalRequested {
-                                approval_id: ApprovalId::from_string(
-                                    ticket.approval_id.to_string(),
-                                ),
-                                call_id: call.call_id.clone(),
-                                tool_name: call.tool_name.clone(),
-                                arguments: call.input.clone(),
-                                risk: RiskLevel::Medium,
-                            },
-                        )
-                        .await?;
-                        emitted += 1;
+                            .await?;
+                            emitted += 1;
+                        }
+                        ModelDirective::Message { role, content } => {
+                            self.append_event(
+                                session_id,
+                                branch_id,
+                                EventKind::Message {
+                                    role,
+                                    content,
+                                    model: Some(completion.model.clone()),
+                                    token_usage: completion.usage,
+                                },
+                            )
+                            .await?;
+                            emitted += 1;
+                        }
+                        ModelDirective::ToolCall { call } => {
+                            emitted += self
+                                .emit_phase(session_id, branch_id, LoopPhase::Gate)
+                                .await?;
+                            self.append_event(
+                                session_id,
+                                branch_id,
+                                EventKind::ToolCallRequested {
+                                    call_id: call.call_id.clone(),
+                                    tool_name: call.tool_name.clone(),
+                                    arguments: call.input.clone(),
+                                    category: None,
+                                },
+                            )
+                            .await?;
+                            emitted += 1;
+
+                            let policy = self
+                                .policy_gate
+                                .evaluate(session_id.clone(), call.requested_capabilities.clone())
+                                .await
+                                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+                            if !policy.denied.is_empty() {
+                                mode = OperatingMode::Recover;
+                                state.error_streak += 1;
+                                state.uncertainty = (state.uncertainty + 0.15).min(1.0);
+                                state.budget.error_budget_remaining =
+                                    state.budget.error_budget_remaining.saturating_sub(1);
+                                self.append_event(
+                                    session_id,
+                                    branch_id,
+                                    EventKind::ToolCallFailed {
+                                        call_id: call.call_id.clone(),
+                                        tool_name: call.tool_name.clone(),
+                                        error: format!(
+                                            "capabilities denied: {}",
+                                            policy
+                                                .denied
+                                                .iter()
+                                                .map(|capability| capability.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(",")
+                                        ),
+                                    },
+                                )
+                                .await?;
+                                emitted += 1;
+                                continue;
+                            }
+
+                            if !policy.requires_approval.is_empty() {
+                                mode = OperatingMode::AskHuman;
+                                for capability in policy.requires_approval {
+                                    let ticket = self
+                                        .approvals
+                                        .enqueue(ApprovalRequest {
+                                            session_id: session_id.clone(),
+                                            call_id: call.call_id.clone(),
+                                            tool_name: call.tool_name.clone(),
+                                            capability: capability.clone(),
+                                            reason: format!(
+                                                "approval required for tool {}",
+                                                call.tool_name
+                                            ),
+                                        })
+                                        .await
+                                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                    self.append_event(
+                                        session_id,
+                                        branch_id,
+                                        EventKind::ApprovalRequested {
+                                            approval_id: ticket.approval_id,
+                                            call_id: call.call_id.clone(),
+                                            tool_name: call.tool_name.clone(),
+                                            arguments: call.input.clone(),
+                                            risk: RiskLevel::Medium,
+                                        },
+                                    )
+                                    .await?;
+                                    emitted += 1;
+                                }
+                                continue;
+                            }
+
+                            emitted += self
+                                .emit_phase(session_id, branch_id, LoopPhase::Execute)
+                                .await?;
+                            let report = self
+                                .tool_harness
+                                .execute(ToolExecutionRequest {
+                                    session_id: session_id.clone(),
+                                    workspace_root: manifest.workspace_root.clone(),
+                                    call: call.clone(),
+                                })
+                                .await
+                                .map_err(|error| anyhow::anyhow!(error.to_string()));
+                            match report {
+                                Ok(report) => {
+                                    emitted += self
+                                        .record_tool_report(
+                                            session_id, branch_id, &manifest, &report,
+                                        )
+                                        .await?;
+                                    self.apply_homeostasis_controllers(&mut state, &report);
+                                    mode = self.estimate_mode(&state, 0);
+                                    info!(
+                                        tool_name = %report.tool_name,
+                                        tool_run_id = %report.tool_run_id,
+                                        exit_status = report.exit_status,
+                                        mode = ?mode,
+                                        "tool execution completed"
+                                    );
+                                }
+                                Err(error) => {
+                                    state.error_streak += 1;
+                                    state.uncertainty = (state.uncertainty + 0.15).min(1.0);
+                                    state.budget.error_budget_remaining =
+                                        state.budget.error_budget_remaining.saturating_sub(1);
+                                    mode = OperatingMode::Recover;
+                                    warn!(
+                                        error = %error,
+                                        error_streak = state.error_streak,
+                                        "tool execution failed"
+                                    );
+                                    self.append_event(
+                                        session_id,
+                                        branch_id,
+                                        EventKind::ToolCallFailed {
+                                            call_id: call.call_id.clone(),
+                                            tool_name: call.tool_name.clone(),
+                                            error: error.to_string(),
+                                        },
+                                    )
+                                    .await?;
+                                    emitted += 1;
+                                }
+                            }
+                        }
                     }
                 }
-                Ok(DispatchResult::Executed(report)) => {
-                    emitted += self
-                        .emit_phase(session_id, branch_id, LoopPhase::Execute)
-                        .await?;
-                    emitted += self
-                        .record_tool_report(session_id, branch_id, &manifest, &report)
-                        .await?;
-                    self.apply_homeostasis_controllers(&mut state, &report);
-                    mode = self.estimate_mode(&state, 0);
-                    info!(
-                        tool_name = %report.tool_name,
-                        tool_run_id = %report.tool_run_id,
-                        exit_status = report.exit_status,
-                        mode = ?mode,
-                        "tool execution completed"
-                    );
-                }
-                Err(error) => {
-                    state.error_streak += 1;
-                    state.uncertainty = (state.uncertainty + 0.15).min(1.0);
-                    state.budget.error_budget_remaining =
-                        state.budget.error_budget_remaining.saturating_sub(1);
-                    mode = OperatingMode::Recover;
-                    warn!(error = %error, error_streak = state.error_streak, "tool execution failed");
 
-                    self.append_event(
-                        session_id,
-                        branch_id,
-                        EventKind::ErrorRaised {
-                            message: error.to_string(),
-                        },
-                    )
-                    .await?;
-                    emitted += 1;
-                }
+                self.append_event(
+                    session_id,
+                    branch_id,
+                    EventKind::StepFinished {
+                        index: 0,
+                        stop_reason: model_stop_reason_string(&completion.stop_reason),
+                        directive_count,
+                    },
+                )
+                .await?;
+                emitted += 1;
+
+                self.append_event(
+                    session_id,
+                    branch_id,
+                    EventKind::RunFinished {
+                        reason: model_stop_reason_string(&completion.stop_reason),
+                        total_iterations: 1,
+                        final_answer: completion.final_answer,
+                        usage: completion.usage,
+                    },
+                )
+                .await?;
+                emitted += 1;
+            }
+            Err(error) => {
+                mode = OperatingMode::Recover;
+                state.error_streak += 1;
+                state.uncertainty = (state.uncertainty + 0.15).min(1.0);
+                state.budget.error_budget_remaining =
+                    state.budget.error_budget_remaining.saturating_sub(1);
+                self.append_event(
+                    session_id,
+                    branch_id,
+                    EventKind::RunErrored {
+                        error: error.to_string(),
+                    },
+                )
+                .await?;
+                emitted += 1;
             }
         }
 
@@ -569,14 +765,19 @@ impl KernelRuntime {
         let actor = actor.into();
         let resolution = self
             .approvals
-            .resolve(approval_id, approved, actor.clone())
+            .resolve(
+                ApprovalId::from_string(approval_id.to_string()),
+                approved,
+                actor.clone(),
+            )
             .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
             .with_context(|| format!("approval not pending: {approval_id}"))?;
 
         let decision = if resolution.approved {
-            aios_protocol::ApprovalDecision::Approved
+            ApprovalDecision::Approved
         } else {
-            aios_protocol::ApprovalDecision::Denied
+            ApprovalDecision::Denied
         };
 
         self.append_event(
@@ -593,7 +794,7 @@ impl KernelRuntime {
     }
 
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EventRecord> {
-        self.journal.subscribe()
+        self.stream.subscribe()
     }
 
     pub async fn record_external_event(
@@ -641,14 +842,10 @@ impl KernelRuntime {
         from_sequence: u64,
         limit: usize,
     ) -> Result<Vec<EventRecord>> {
-        self.journal
-            .read_from(
-                session_id.clone(),
-                Some(branch_id.clone()),
-                from_sequence,
-                limit,
-            )
+        self.event_store
+            .read(session_id.clone(), branch_id.clone(), from_sequence, limit)
             .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 
     fn estimate_mode(&self, state: &AgentStateVector, pending_approvals: usize) -> OperatingMode {
@@ -877,8 +1074,9 @@ impl KernelRuntime {
 
         if let Some(observation) = observation {
             self.memory
-                .append_observation(session_id, &observation)
+                .append_observation(session_id.clone(), observation.clone())
                 .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
                 .context("failed appending auto observation")?;
             self.append_event(
                 session_id,
@@ -924,28 +1122,33 @@ impl KernelRuntime {
             "appending event"
         );
         let event = EventRecord::new(session_id.clone(), branch_id.clone(), sequence, kind);
-        if let Err(append_error) = self.journal.append_and_publish(event).await {
-            if let Err(resync_error) = self.resync_next_sequence(session_id, branch_id).await {
+        let persisted = match self.event_store.append(event).await {
+            Ok(persisted) => persisted,
+            Err(append_error) => {
+                if let Err(resync_error) = self.resync_next_sequence(session_id, branch_id).await {
+                    warn!(
+                        session_id = %session_id,
+                        branch = %branch_id.as_str(),
+                        error = %append_error,
+                        resync_error = %resync_error,
+                        "event append failed and sequence resync failed"
+                    );
+                    return Err(anyhow::anyhow!(append_error.to_string())).context(format!(
+                        "failed appending event and failed sequence resync: {resync_error}"
+                    ));
+                }
                 warn!(
                     session_id = %session_id,
                     branch = %branch_id.as_str(),
                     error = %append_error,
-                    resync_error = %resync_error,
-                    "event append failed and sequence resync failed"
+                    "event append failed; sequence resynced"
                 );
-                return Err(append_error).context(format!(
-                    "failed appending event and failed sequence resync: {resync_error}"
-                ));
+                return Err(anyhow::anyhow!(append_error.to_string()))
+                    .context("failed appending event; sequence was resynced");
             }
-            warn!(
-                session_id = %session_id,
-                branch = %branch_id.as_str(),
-                error = %append_error,
-                "event append failed; sequence resynced"
-            );
-            return Err(append_error).context("failed appending event; sequence was resynced");
-        }
-        self.mark_branch_head(session_id, branch_id, sequence)?;
+        };
+        let _ = self.stream.send(persisted.clone());
+        self.mark_branch_head(session_id, branch_id, persisted.sequence)?;
         Ok(())
     }
 
@@ -1000,9 +1203,10 @@ impl KernelRuntime {
         branch_id: &BranchId,
     ) -> Result<()> {
         let latest = self
-            .journal
-            .latest_sequence(session_id.clone(), Some(branch_id.clone()))
+            .event_store
+            .head(session_id.clone(), branch_id.clone())
             .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
             .context("failed loading latest sequence for resync")?;
         let mut sessions = self.sessions.lock();
         let session = sessions
@@ -1211,6 +1415,52 @@ impl KernelRuntime {
 fn sha256_json<T: Serialize>(value: &T) -> Result<String> {
     let payload = serde_json::to_vec(value)?;
     Ok(sha256_bytes(&payload))
+}
+
+fn model_stop_reason_string(stop_reason: &aios_protocol::ModelStopReason) -> String {
+    match stop_reason {
+        aios_protocol::ModelStopReason::Completed => "completed".to_owned(),
+        aios_protocol::ModelStopReason::ToolCall => "tool_call".to_owned(),
+        aios_protocol::ModelStopReason::MaxIterations => "max_iterations".to_owned(),
+        aios_protocol::ModelStopReason::Cancelled => "cancelled".to_owned(),
+        aios_protocol::ModelStopReason::Error => "error".to_owned(),
+        aios_protocol::ModelStopReason::Other(reason) => reason.clone(),
+    }
+}
+
+fn extract_observation(event: &EventRecord) -> Option<aios_protocol::Observation> {
+    let text = match &event.kind {
+        EventKind::ToolCallCompleted {
+            tool_name,
+            result,
+            status,
+            ..
+        } => format!("tool call completed ({tool_name}): {result} [status={status:?}]"),
+        EventKind::ErrorRaised { message } => format!("error observed: {message}"),
+        EventKind::CheckpointCreated { checkpoint_id, .. } => {
+            format!("checkpoint created: {checkpoint_id}")
+        }
+        _ => return None,
+    };
+
+    Some(aios_protocol::Observation {
+        observation_id: uuid::Uuid::new_v4(),
+        created_at: event.timestamp,
+        text,
+        tags: vec!["auto".to_owned()],
+        provenance: aios_protocol::Provenance {
+            event_start: event.sequence,
+            event_end: event.sequence,
+            files: vec![FileProvenance {
+                path: format!(
+                    "events/{}.jsonl#branch={}",
+                    event.session_id.as_str(),
+                    event.branch_id.as_str()
+                ),
+                sha256: "pending".to_owned(),
+            }],
+        },
+    })
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {

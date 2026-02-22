@@ -16,6 +16,7 @@
 //! - [`tool`] — ToolCall, ToolOutcome
 //! - [`memory`] — SoulProfile, Observation, Provenance, MemoryScope
 //! - [`session`] — SessionManifest, BranchInfo, CheckpointManifest
+//! - [`ports`] — Runtime boundary ports (event store, provider, tools, policy, approvals, memory)
 //! - [`error`] — KernelError, KernelResult
 
 pub mod error;
@@ -24,6 +25,7 @@ pub mod ids;
 pub mod memory;
 pub mod mode;
 pub mod policy;
+pub mod ports;
 pub mod session;
 pub mod state;
 pub mod tool;
@@ -41,6 +43,12 @@ pub use ids::{
 pub use memory::{FileProvenance, MemoryScope, Observation, Provenance, SoulProfile};
 pub use mode::{GatingProfile, OperatingMode};
 pub use policy::{Capability, PolicyEvaluation, PolicySet};
+pub use ports::{
+    ApprovalPort, ApprovalRequest, ApprovalResolution, ApprovalTicket, EventRecordStream,
+    EventStorePort, MemoryPort, MemoryQuery, ModelCompletion, ModelCompletionRequest,
+    ModelDirective, ModelProviderPort, ModelStopReason, PolicyGateDecision, PolicyGatePort,
+    ToolExecutionReport, ToolExecutionRequest, ToolHarnessPort,
+};
 pub use session::{
     BranchInfo, BranchMergeResult, CheckpointManifest, ModelRouting, SessionManifest,
 };

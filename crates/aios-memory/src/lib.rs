@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use aios_protocol::{
-    EventKind, EventRecord, FileProvenance, Observation, Provenance, SessionId, SoulProfile,
+    EventKind, EventRecord, FileProvenance, KernelError, MemoryPort, MemoryQuery, Observation,
+    Provenance, SessionId, SoulProfile,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -54,6 +55,10 @@ impl WorkspaceMemoryStore {
         }
         Ok(())
     }
+}
+
+fn to_kernel_error(error: anyhow::Error) -> KernelError {
+    KernelError::Runtime(error.to_string())
 }
 
 #[async_trait]
@@ -129,6 +134,64 @@ impl MemoryStore for WorkspaceMemoryStore {
         observations.reverse();
         observations.truncate(limit);
         observations.reverse();
+
+        Ok(observations)
+    }
+}
+
+#[async_trait]
+impl MemoryPort for WorkspaceMemoryStore {
+    async fn load_soul(
+        &self,
+        session_id: SessionId,
+    ) -> std::result::Result<SoulProfile, KernelError> {
+        <Self as MemoryStore>::load_soul(self, &session_id)
+            .await
+            .map_err(to_kernel_error)
+    }
+
+    async fn save_soul(
+        &self,
+        session_id: SessionId,
+        soul: SoulProfile,
+    ) -> std::result::Result<(), KernelError> {
+        <Self as MemoryStore>::save_soul(self, &session_id, &soul)
+            .await
+            .map_err(to_kernel_error)
+    }
+
+    async fn append_observation(
+        &self,
+        session_id: SessionId,
+        observation: Observation,
+    ) -> std::result::Result<(), KernelError> {
+        <Self as MemoryStore>::append_observation(self, &session_id, &observation)
+            .await
+            .map_err(to_kernel_error)
+    }
+
+    async fn query_observations(
+        &self,
+        session_id: SessionId,
+        query: MemoryQuery,
+    ) -> std::result::Result<Vec<Observation>, KernelError> {
+        let mut observations =
+            <Self as MemoryStore>::list_observations(self, &session_id, query.limit)
+                .await
+                .map_err(to_kernel_error)?;
+
+        if !query.tags.is_empty() {
+            observations.retain(|observation| {
+                query
+                    .tags
+                    .iter()
+                    .all(|required_tag| observation.tags.iter().any(|tag| tag == required_tag))
+            });
+        }
+
+        if let Some(text) = &query.text {
+            observations.retain(|observation| observation.text.contains(text));
+        }
 
         Ok(observations)
     }
