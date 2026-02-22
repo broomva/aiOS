@@ -216,6 +216,10 @@ impl KernelRuntime {
         self.sessions.lock().contains_key(session_id.as_str())
     }
 
+    pub fn root_path(&self) -> &Path {
+        &self.config.root
+    }
+
     pub async fn tick(&self, session_id: &SessionId, input: TickInput) -> Result<TickOutput> {
         self.tick_on_branch(session_id, &BranchId::main(), input)
             .await
