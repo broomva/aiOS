@@ -45,9 +45,9 @@ pub use mode::{GatingProfile, OperatingMode};
 pub use policy::{Capability, PolicyEvaluation, PolicySet};
 pub use ports::{
     ApprovalPort, ApprovalRequest, ApprovalResolution, ApprovalTicket, EventRecordStream,
-    EventStorePort, MemoryPort, MemoryQuery, ModelCompletion, ModelCompletionRequest,
-    ModelDirective, ModelProviderPort, ModelStopReason, PolicyGateDecision, PolicyGatePort,
-    ToolExecutionReport, ToolExecutionRequest, ToolHarnessPort,
+    EventStorePort, ModelCompletion, ModelCompletionRequest, ModelDirective, ModelProviderPort,
+    ModelStopReason, PolicyGateDecision, PolicyGatePort, ToolExecutionReport, ToolExecutionRequest,
+    ToolHarnessPort,
 };
 pub use session::{
     BranchInfo, BranchMergeResult, CheckpointManifest, ModelRouting, SessionManifest,

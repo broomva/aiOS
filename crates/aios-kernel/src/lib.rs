@@ -2,13 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aios_events::{EventJournal, EventStreamHub, FileEventStore};
-use aios_memory::WorkspaceMemoryStore;
 use aios_policy::{ApprovalQueue, SessionPolicyEngine};
 use aios_protocol::{
     BranchId, BranchInfo, BranchMergeResult, EventKind, EventRecord, EventStorePort, KernelResult,
-    MemoryPort, ModelCompletion, ModelCompletionRequest, ModelDirective, ModelProviderPort,
-    ModelRouting, ModelStopReason, PolicyGatePort, PolicySet, SessionId, SessionManifest,
-    TokenUsage, ToolCall, ToolHarnessPort,
+    ModelCompletion, ModelCompletionRequest, ModelDirective, ModelProviderPort, ModelRouting,
+    ModelStopReason, PolicyGatePort, PolicySet, SessionId, SessionManifest, TokenUsage, ToolCall,
+    ToolHarnessPort,
 };
 use aios_runtime::{KernelRuntime, RuntimeConfig, TickInput, TickOutput};
 use aios_sandbox::LocalSandboxRunner;
@@ -85,7 +84,6 @@ impl KernelBuilder {
 
     pub fn build(self) -> AiosKernel {
         let events_root = self.root.join("kernel");
-        let session_root = self.root.join("sessions");
 
         let event_store_backend = Arc::new(FileEventStore::new(events_root));
         let stream = EventStreamHub::new(1024);
@@ -102,14 +100,12 @@ impl KernelBuilder {
         let dispatcher = Arc::new(ToolDispatcher::new(registry, policy_engine, sandbox));
         let tool_harness: Arc<dyn ToolHarnessPort> = dispatcher;
 
-        let memory: Arc<dyn MemoryPort> = Arc::new(WorkspaceMemoryStore::new(session_root));
         let provider: Arc<dyn ModelProviderPort> = Arc::new(BaselineModelProvider);
         let runtime = KernelRuntime::new(
             RuntimeConfig::new(self.root),
             event_store,
             provider,
             tool_harness,
-            memory,
             approvals,
             policy_gate,
         );

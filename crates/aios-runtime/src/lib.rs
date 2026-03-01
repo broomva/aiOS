@@ -5,10 +5,10 @@ use std::sync::Arc;
 use aios_protocol::{
     AgentStateVector, ApprovalDecision, ApprovalId, ApprovalPort, ApprovalRequest, BranchId,
     BranchInfo, BranchMergeResult, BudgetState, CheckpointId, CheckpointManifest, EventKind,
-    EventRecord, EventStorePort, FileProvenance, LoopPhase, MemoryPort, ModelCompletionRequest,
-    ModelDirective, ModelProviderPort, ModelRouting, OperatingMode, PolicyGatePort, PolicySet,
-    RiskLevel, RunId, SessionId, SessionManifest, SpanStatus, ToolCall, ToolExecutionReport,
-    ToolExecutionRequest, ToolHarnessPort, ToolOutcome,
+    EventRecord, EventStorePort, FileProvenance, LoopPhase, ModelCompletionRequest, ModelDirective,
+    ModelProviderPort, ModelRouting, OperatingMode, PolicyGatePort, PolicySet, RiskLevel, RunId,
+    SessionId, SessionManifest, SpanStatus, ToolCall, ToolExecutionReport, ToolExecutionRequest,
+    ToolHarnessPort, ToolOutcome,
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -75,7 +75,6 @@ pub struct KernelRuntime {
     event_store: Arc<dyn EventStorePort>,
     provider: Arc<dyn ModelProviderPort>,
     tool_harness: Arc<dyn ToolHarnessPort>,
-    memory: Arc<dyn MemoryPort>,
     approvals: Arc<dyn ApprovalPort>,
     policy_gate: Arc<dyn PolicyGatePort>,
     stream: broadcast::Sender<EventRecord>,
@@ -88,7 +87,6 @@ impl KernelRuntime {
         event_store: Arc<dyn EventStorePort>,
         provider: Arc<dyn ModelProviderPort>,
         tool_harness: Arc<dyn ToolHarnessPort>,
-        memory: Arc<dyn MemoryPort>,
         approvals: Arc<dyn ApprovalPort>,
         policy_gate: Arc<dyn PolicyGatePort>,
     ) -> Self {
@@ -98,7 +96,6 @@ impl KernelRuntime {
             event_store,
             provider,
             tool_harness,
-            memory,
             approvals,
             policy_gate,
             stream,
@@ -1077,11 +1074,6 @@ impl KernelRuntime {
         ));
 
         if let Some(observation) = observation {
-            self.memory
-                .append_observation(session_id.clone(), observation.clone())
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))
-                .context("failed appending auto observation")?;
             self.append_event(
                 session_id,
                 branch_id,
@@ -1334,8 +1326,32 @@ impl KernelRuntime {
         let session = sessions
             .get_mut(session_id.as_str())
             .with_context(|| format!("session not found: {session_id}"))?;
-        session.state_vector = state;
+        session.state_vector = state.clone();
         session.mode = mode;
+
+        // Sync lakebase at the workspace root
+        if let Some(parent) = self.config.root.parent() {
+            let lake_dir = parent.join(".lake");
+            let state_json = serde_json::to_string_pretty(&state).unwrap_or_default();
+            let mode_str = match mode {
+                OperatingMode::Explore => "explore",
+                OperatingMode::Execute => "execute",
+                OperatingMode::Verify => "verify",
+                OperatingMode::AskHuman => "ask_human",
+                OperatingMode::Recover => "recover",
+                OperatingMode::Sleep => "sleep",
+            };
+
+            // Fire and forget IO, but in an async context we need to spawn it or do it blocking
+            // Since this is a synchronous function, we can't await. Let's spawn it.
+            let lake_dir_clone = lake_dir.clone();
+            tokio::spawn(async move {
+                let _ = fs::create_dir_all(&lake_dir_clone).await;
+                let _ = fs::write(lake_dir_clone.join("state.json"), state_json).await;
+                let _ = fs::write(lake_dir_clone.join("mode.txt"), mode_str).await;
+            });
+        }
+
         Ok(())
     }
 

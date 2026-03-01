@@ -52,7 +52,6 @@ name = "aios-kernel"
 version = "0.1.0"
 dependencies = [
  "aios-events",
- "aios-memory",
  "aios-policy",
  "aios-protocol",
  "aios-runtime",
@@ -63,18 +62,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "uuid",
-]
-
-[[package]]
-name = "aios-memory"
-version = "0.1.0"
-dependencies = [
- "aios-protocol",
- "anyhow",
- "async-trait",
- "serde_json",
- "tokio",
  "uuid",
 ]
 

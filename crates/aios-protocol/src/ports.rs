@@ -11,7 +11,6 @@
 use crate::error::KernelResult;
 use crate::event::{EventRecord, TokenUsage};
 use crate::ids::{ApprovalId, BranchId, RunId, SessionId, ToolRunId};
-use crate::memory::{Observation, SoulProfile};
 use crate::policy::Capability;
 use crate::tool::{ToolCall, ToolOutcome};
 use async_trait::async_trait;
@@ -134,25 +133,6 @@ pub struct ApprovalResolution {
     pub resolved_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryQuery {
-    pub limit: usize,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-}
-
-impl Default for MemoryQuery {
-    fn default() -> Self {
-        Self {
-            limit: 256,
-            tags: Vec::new(),
-            text: None,
-        }
-    }
-}
-
 #[async_trait]
 pub trait EventStorePort: Send + Sync {
     async fn append(&self, event: EventRecord) -> KernelResult<EventRecord>;
@@ -209,20 +189,4 @@ pub trait ApprovalPort: Send + Sync {
         approved: bool,
         actor: String,
     ) -> KernelResult<ApprovalResolution>;
-}
-
-#[async_trait]
-pub trait MemoryPort: Send + Sync {
-    async fn load_soul(&self, session_id: SessionId) -> KernelResult<SoulProfile>;
-    async fn save_soul(&self, session_id: SessionId, soul: SoulProfile) -> KernelResult<()>;
-    async fn append_observation(
-        &self,
-        session_id: SessionId,
-        observation: Observation,
-    ) -> KernelResult<()>;
-    async fn query_observations(
-        &self,
-        session_id: SessionId,
-        query: MemoryQuery,
-    ) -> KernelResult<Vec<Observation>>;
 }
