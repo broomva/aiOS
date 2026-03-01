@@ -4,9 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+description = "Policy engine and capability-based authorization for Agent OS"
 
 [dependencies]
-aios-protocol = { path = "../aios-protocol" }
+aios-protocol = { path = "../aios-protocol", version = "0.1.0" }
 async-trait.workspace = true
 chrono.workspace = true
 indexmap.workspace = true

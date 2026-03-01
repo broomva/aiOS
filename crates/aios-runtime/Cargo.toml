@@ -4,9 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+description = "Canonical Agent OS runtime engine"
 
 [dependencies]
-aios-protocol = { path = "../aios-protocol" }
+aios-protocol = { path = "../aios-protocol", version = "0.1.0" }
 anyhow.workspace = true
 chrono.workspace = true
 hex.workspace = true
