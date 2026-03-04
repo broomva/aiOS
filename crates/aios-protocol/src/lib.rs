@@ -1,7 +1,7 @@
 //! # aios-protocol — Canonical Agent OS Protocol
 //!
 //! This crate defines the shared types, event taxonomy, and trait interfaces
-//! that all Agent OS projects (Arcan, Lago, Autonomic) depend on.
+//! that all Agent OS projects (Arcan, Lago, Praxis, Autonomic) depend on.
 //!
 //! It is intentionally dependency-light (no runtime deps like tokio, axum, or redb)
 //! so it can be used as a pure contract crate.
@@ -13,7 +13,8 @@
 //! - [`state`] — AgentStateVector, BudgetState (homeostasis vitals)
 //! - [`mode`] — OperatingMode, GatingProfile (operating constraints)
 //! - [`policy`] — Capability, PolicySet, PolicyEvaluation
-//! - [`tool`] — ToolCall, ToolOutcome
+//! - [`tool`] — ToolCall, ToolOutcome, ToolDefinition, ToolResult, Tool trait, ToolRegistry
+//! - [`sandbox`] — SandboxTier, SandboxLimits, NetworkPolicy
 //! - [`memory`] — SoulProfile, Observation, Provenance, MemoryScope
 //! - [`session`] — SessionManifest, BranchInfo, CheckpointManifest
 //! - [`ports`] — Runtime boundary ports (event store, provider, tools, policy, approvals, memory)
@@ -26,6 +27,7 @@ pub mod memory;
 pub mod mode;
 pub mod policy;
 pub mod ports;
+pub mod sandbox;
 pub mod session;
 pub mod state;
 pub mod tool;
@@ -49,6 +51,7 @@ pub use ports::{
     ModelStopReason, PolicyGateDecision, PolicyGatePort, ToolExecutionReport, ToolExecutionRequest,
     ToolHarnessPort,
 };
+pub use sandbox::{NetworkPolicy, SandboxLimits, SandboxTier};
 pub use session::{
     BranchInfo, BranchMergeResult, CheckpointManifest, ModelRouting, SessionManifest,
 };
@@ -56,4 +59,7 @@ pub use state::{
     AgentStateVector, BlobRef, BudgetState, CanonicalState, MemoryNamespace, PatchApplyError,
     PatchOp, ProvenanceRef, StatePatch, VersionedCanonicalState,
 };
-pub use tool::{ToolCall, ToolOutcome};
+pub use tool::{
+    Tool, ToolAnnotations, ToolCall, ToolContent, ToolContext, ToolDefinition, ToolError,
+    ToolOutcome, ToolRegistry, ToolResult,
+};
