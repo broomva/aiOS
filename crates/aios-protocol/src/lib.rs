@@ -46,16 +46,16 @@ pub use ids::{
 };
 pub use memory::{FileProvenance, MemoryScope, Observation, Provenance, SoulProfile};
 pub use mode::{GatingProfile, OperatingMode};
+pub use payment::{
+    PaymentAuthorizationDecision, PaymentAuthorizationRequest, PaymentPort,
+    PaymentSettlementReceipt, WalletBalanceInfo,
+};
 pub use policy::{Capability, PolicyEvaluation, PolicySet};
 pub use ports::{
     ApprovalPort, ApprovalRequest, ApprovalResolution, ApprovalTicket, EventRecordStream,
     EventStorePort, ModelCompletion, ModelCompletionRequest, ModelDirective, ModelProviderPort,
     ModelStopReason, PolicyGateDecision, PolicyGatePort, ToolExecutionReport, ToolExecutionRequest,
     ToolHarnessPort,
-};
-pub use payment::{
-    PaymentAuthorizationDecision, PaymentAuthorizationRequest, PaymentPort,
-    PaymentSettlementReceipt, WalletBalanceInfo,
 };
 pub use sandbox::{NetworkPolicy, SandboxLimits, SandboxTier};
 pub use session::{

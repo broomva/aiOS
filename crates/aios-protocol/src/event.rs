@@ -1676,7 +1676,10 @@ mod tests {
         let json = serde_json::to_string(&kind).unwrap();
         assert!(json.contains("\"type\":\"HiveTaskCreated\""));
         let back: EventKind = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, EventKind::HiveTaskCreated { agent_count: 3, .. }));
+        assert!(matches!(
+            back,
+            EventKind::HiveTaskCreated { agent_count: 3, .. }
+        ));
     }
 
     #[test]
@@ -1702,7 +1705,10 @@ mod tests {
         };
         let json = serde_json::to_string(&kind).unwrap();
         let back: EventKind = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, EventKind::HiveSelectionMade { generation: 2, .. }));
+        assert!(matches!(
+            back,
+            EventKind::HiveSelectionMade { generation: 2, .. }
+        ));
     }
 
     #[test]
@@ -1715,7 +1721,10 @@ mod tests {
         };
         let json = serde_json::to_string(&kind).unwrap();
         let back: EventKind = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, EventKind::HiveGenerationCompleted { generation: 3, .. }));
+        assert!(matches!(
+            back,
+            EventKind::HiveGenerationCompleted { generation: 3, .. }
+        ));
     }
 
     #[test]
@@ -1728,7 +1737,13 @@ mod tests {
         };
         let json = serde_json::to_string(&kind).unwrap();
         let back: EventKind = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, EventKind::HiveTaskCompleted { total_generations: 5, .. }));
+        assert!(matches!(
+            back,
+            EventKind::HiveTaskCompleted {
+                total_generations: 5,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1740,7 +1755,10 @@ mod tests {
         });
         let json = serde_json::to_string(&envelope).unwrap();
         let back: EventEnvelope = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back.kind, EventKind::HiveTaskCreated { agent_count: 5, .. }));
+        assert!(matches!(
+            back.kind,
+            EventKind::HiveTaskCreated { agent_count: 5, .. }
+        ));
     }
 
     #[test]
