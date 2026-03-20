@@ -255,6 +255,10 @@ impl KernelRuntime {
         };
 
         let mut emitted = 0_u64;
+        #[allow(unused_assignments)]
+        let mut previous_mode: Option<OperatingMode> = None;
+        let mut _tool_calls_this_tick = 0_u32;
+        let mut _file_mutations_this_tick = 0_u32;
 
         emitted += self
             .emit_phase(session_id, branch_id, LoopPhase::Perceive)
@@ -290,6 +294,7 @@ impl KernelRuntime {
             .await
             .unwrap_or_default();
         let mut mode = self.estimate_mode(&state, pending_approvals.len());
+        previous_mode = Some(mode);
 
         self.append_event(
             session_id,
@@ -402,6 +407,8 @@ impl KernelRuntime {
                                 .await
                                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
+                            // Track tool calls for per-tick Autonomic limits.
+                            _tool_calls_this_tick += 1;
                             if !policy.denied.is_empty() {
                                 mode = OperatingMode::Recover;
                                 state.error_streak += 1;
@@ -483,13 +490,40 @@ impl KernelRuntime {
                                             session_id, branch_id, &manifest, &report,
                                         )
                                         .await?;
+                                    if let ToolOutcome::Success { output } = &report.outcome
+                                        && output.get("path").is_some()
+                                    {
+                                        _file_mutations_this_tick += 1;
+                                    }
                                     self.apply_homeostasis_controllers(&mut state, &report);
-                                    mode = self.estimate_mode(&state, 0);
+                                    let new_mode = self.estimate_mode(&state, 0);
+                                    if let Some(prev) = previous_mode
+                                        && prev != new_mode
+                                    {
+                                        self.append_event(
+                                            session_id,
+                                            branch_id,
+                                            EventKind::ModeChanged {
+                                                from: prev,
+                                                to: new_mode,
+                                                reason: format!(
+                                                    "post-tool homeostasis: tool={} exit={}",
+                                                    report.tool_name, report.exit_status
+                                                ),
+                                            },
+                                        )
+                                        .await?;
+                                        emitted += 1;
+                                    }
+                                    mode = new_mode;
+                                    previous_mode = Some(mode);
                                     info!(
                                         tool_name = %report.tool_name,
                                         tool_run_id = %report.tool_run_id,
                                         exit_status = report.exit_status,
                                         mode = ?mode,
+                                        tool_calls = _tool_calls_this_tick,
+                                        file_mutations = _file_mutations_this_tick,
                                         "tool execution completed"
                                     );
                                 }
@@ -498,7 +532,24 @@ impl KernelRuntime {
                                     state.uncertainty = (state.uncertainty + 0.15).min(1.0);
                                     state.budget.error_budget_remaining =
                                         state.budget.error_budget_remaining.saturating_sub(1);
-                                    mode = OperatingMode::Recover;
+                                    let new_mode = OperatingMode::Recover;
+                                    if let Some(prev) = previous_mode
+                                        && prev != new_mode
+                                    {
+                                        self.append_event(
+                                            session_id,
+                                            branch_id,
+                                            EventKind::ModeChanged {
+                                                from: prev,
+                                                to: new_mode,
+                                                reason: format!("tool execution error: {error}"),
+                                            },
+                                        )
+                                        .await?;
+                                        emitted += 1;
+                                    }
+                                    mode = new_mode;
+                                    previous_mode = Some(mode);
                                     warn!(
                                         error = %error,
                                         error_streak = state.error_streak,
