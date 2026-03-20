@@ -17,7 +17,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::sync::broadcast;
-use tracing::{debug, info, instrument, warn};
+use tracing::{Instrument, debug, info, instrument, warn};
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -259,6 +259,16 @@ impl KernelRuntime {
         emitted += self
             .emit_phase(session_id, branch_id, LoopPhase::Perceive)
             .await?;
+
+        // Record initial budget metrics during the Perceive phase.
+        {
+            let metrics = vigil::metrics::GenAiMetrics::new("arcan");
+            metrics.record_budget(
+                state.budget.tokens_remaining,
+                state.budget.cost_remaining_usd,
+            );
+        }
+
         emitted += self
             .emit_phase(session_id, branch_id, LoopPhase::Deliberate)
             .await?;
@@ -510,6 +520,10 @@ impl KernelRuntime {
                         }
                     }
                 }
+
+                emitted += self
+                    .emit_phase(session_id, branch_id, LoopPhase::Commit)
+                    .await?;
 
                 self.append_event(
                     session_id,
@@ -947,6 +961,30 @@ impl KernelRuntime {
         .await?;
         emitted += 1;
 
+        // Record budget metrics via Vigil GenAI metrics.
+        {
+            let metrics = vigil::metrics::GenAiMetrics::new("arcan");
+            metrics.record_budget(
+                state.budget.tokens_remaining,
+                state.budget.cost_remaining_usd,
+            );
+
+            // Detect and record mode transitions in the Reflect phase.
+            let previous_mode = {
+                let sessions = self.sessions.lock();
+                sessions
+                    .get(session_id.as_str())
+                    .map(|s| s.mode)
+                    .unwrap_or(OperatingMode::Explore)
+            };
+            if previous_mode != *mode {
+                let from_str = operating_mode_str(&previous_mode);
+                let to_str = operating_mode_str(mode);
+                metrics.record_mode_transition(from_str, to_str);
+                debug!(from = from_str, to = to_str, "operating mode transition");
+            }
+        }
+
         self.append_event(
             session_id,
             branch_id,
@@ -1112,9 +1150,14 @@ impl KernelRuntime {
         branch_id: &BranchId,
         phase: LoopPhase,
     ) -> Result<u64> {
-        self.append_event(session_id, branch_id, EventKind::PhaseEntered { phase })
-            .await?;
-        Ok(1)
+        let phase_span = vigil::spans::phase_span(phase);
+        async {
+            self.append_event(session_id, branch_id, EventKind::PhaseEntered { phase })
+                .await?;
+            Ok(1)
+        }
+        .instrument(phase_span)
+        .await
     }
 
     async fn append_event(
@@ -1132,7 +1175,11 @@ impl KernelRuntime {
             event_kind,
             "appending event"
         );
-        let event = EventRecord::new(session_id.clone(), branch_id.clone(), sequence, kind);
+        let mut event = EventRecord::new(session_id.clone(), branch_id.clone(), sequence, kind);
+
+        // Dual-write: embed OTel trace/span IDs into the event for post-hoc correlation.
+        write_trace_context_on_record(&mut event);
+
         let persisted = match self.event_store.append(event).await {
             Ok(persisted) => persisted,
             Err(append_error) => {
@@ -1450,6 +1497,36 @@ impl KernelRuntime {
 fn sha256_json<T: Serialize>(value: &T) -> Result<String> {
     let payload = serde_json::to_vec(value)?;
     Ok(sha256_bytes(&payload))
+}
+
+/// Write the current OTel trace context (trace_id, span_id) into an EventRecord.
+///
+/// Enables dual-write: persisted events carry OTel correlation IDs so they
+/// can be linked back to their distributed traces for post-hoc analysis.
+fn write_trace_context_on_record(event: &mut EventRecord) {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let current_span = tracing::Span::current();
+    let otel_context = current_span.context();
+    let span_ref = otel_context.span();
+    let span_context = span_ref.span_context();
+
+    if span_context.is_valid() {
+        event.trace_id = Some(span_context.trace_id().to_string());
+        event.span_id = Some(span_context.span_id().to_string());
+    }
+}
+
+fn operating_mode_str(mode: &OperatingMode) -> &'static str {
+    match mode {
+        OperatingMode::Explore => "explore",
+        OperatingMode::Execute => "execute",
+        OperatingMode::Verify => "verify",
+        OperatingMode::AskHuman => "ask_human",
+        OperatingMode::Recover => "recover",
+        OperatingMode::Sleep => "sleep",
+    }
 }
 
 fn model_stop_reason_string(stop_reason: &aios_protocol::ModelStopReason) -> String {

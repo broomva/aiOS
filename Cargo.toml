@@ -41,6 +41,9 @@ tower-http = { version = "0.6", features = ["trace", "cors"] }
 futures-util = "0.3"
 async-stream = "0.3"
 
+# Observability
+vigil = { path = "../vigil" }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unused_must_use = "deny"

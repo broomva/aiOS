@@ -18,7 +18,10 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-opentelemetry = "0.30"
+opentelemetry = "0.29"
 uuid.workspace = true
+vigil.workspace = true
 
 [lints]
 workspace = true
