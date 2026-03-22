@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone dependencies
+        run: |
+          git clone --depth 1 https://github.com/broomva/vigil.git ../vigil
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish crates (dependency order)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # Tier 1: no internal deps
+          cargo publish -p aios-protocol || true
+          sleep 30
+
+          # Tier 2: depends on aios-protocol
+          cargo publish -p aios-events || true
+          cargo publish -p aios-policy || true
+          cargo publish -p aios-runtime || true
+          cargo publish -p aios-sandbox || true
+          sleep 30
+
+          # Tier 3: depends on tier-2
+          cargo publish -p aios-tools || true
+          cargo publish -p aios-kernel || true
+          sleep 30
+
+          # Tier 4: apps
+          cargo publish -p aios-api || true
+          cargo publish -p aiosd || true
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
