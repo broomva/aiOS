@@ -50,13 +50,19 @@ pub struct PolicySet {
 
 impl PolicySet {
     /// Heavily restricted — anonymous public users. No side-effecting capabilities.
+    ///
+    /// Shell execution (`exec:cmd:*`) is NOT gated (approval queue) — it is
+    /// absent from both `allow_capabilities` and `gate_capabilities`, so the
+    /// policy engine immediately **denies** any bash/shell tool call without
+    /// creating an approval ticket. BRO-216.
+    ///
     /// 5 events/turn, 30s tool runtime.
     pub fn anonymous() -> Self {
         Self {
             allow_capabilities: vec![Capability::new("fs:read:/session/**")],
+            // exec:cmd:* removed — falls through to denied by StaticPolicyEngine.
             gate_capabilities: vec![
                 Capability::new("fs:write:**"),
-                Capability::new("exec:cmd:*"),
                 Capability::new("net:egress:*"),
                 Capability::new("secrets:read:*"),
             ],
@@ -65,17 +71,33 @@ impl PolicySet {
         }
     }
 
-    /// Read + search only — authenticated free tier users.
+    /// Read + network + limited shell — authenticated free tier users.
+    ///
+    /// Shell execution is restricted to a safe read-only whitelist; unlisted
+    /// commands are denied immediately (not gated). BRO-216.
+    ///
     /// 15 events/turn, 30s tool runtime.
     pub fn free() -> Self {
         Self {
             allow_capabilities: vec![
                 Capability::new("fs:read:/session/**"),
                 Capability::new("net:egress:*"),
+                // Shell whitelist — safe read-only commands only.
+                Capability::new("exec:cmd:cat"),
+                Capability::new("exec:cmd:ls"),
+                Capability::new("exec:cmd:echo"),
+                Capability::new("exec:cmd:grep"),
+                Capability::new("exec:cmd:jq"),
+                Capability::new("exec:cmd:python3"),
+                Capability::new("exec:cmd:find"),
+                Capability::new("exec:cmd:head"),
+                Capability::new("exec:cmd:tail"),
+                Capability::new("exec:cmd:sort"),
+                Capability::new("exec:cmd:wc"),
             ],
+            // exec:cmd:* removed — unlisted exec commands fall through to denied.
             gate_capabilities: vec![
                 Capability::new("fs:write:**"),
-                Capability::new("exec:cmd:*"),
                 Capability::new("secrets:read:*"),
             ],
             max_tool_runtime_secs: 30,
@@ -166,20 +188,23 @@ mod tests {
         let ps = PolicySet::anonymous();
         assert_eq!(ps.allow_capabilities.len(), 1);
         assert_eq!(ps.allow_capabilities[0].as_str(), "fs:read:/session/**");
-        assert_eq!(ps.gate_capabilities.len(), 4);
+        // exec:cmd:* must NOT be in gate_capabilities — it must be denied outright (BRO-216).
+        assert_eq!(ps.gate_capabilities.len(), 3);
         assert_eq!(ps.max_tool_runtime_secs, 30);
         assert_eq!(ps.max_events_per_turn, 5);
-        // anonymous cannot exec
+        // anonymous: exec is in neither allow nor gate → immediately denied
         let exec_cap = Capability::new("exec:cmd:*");
         assert!(!ps.allow_capabilities.contains(&exec_cap));
-        assert!(ps.gate_capabilities.contains(&exec_cap));
+        assert!(!ps.gate_capabilities.contains(&exec_cap));
     }
 
     #[test]
     fn policy_set_free() {
         let ps = PolicySet::free();
-        assert_eq!(ps.allow_capabilities.len(), 2);
-        assert_eq!(ps.gate_capabilities.len(), 3);
+        // allow: session read + net egress + 11 whitelisted exec commands
+        assert_eq!(ps.allow_capabilities.len(), 13);
+        // gate: fs:write + secrets (exec removed — unlisted exec → denied)
+        assert_eq!(ps.gate_capabilities.len(), 2);
         assert_eq!(ps.max_tool_runtime_secs, 30);
         assert_eq!(ps.max_events_per_turn, 15);
         // free allows net egress
@@ -187,9 +212,18 @@ mod tests {
             ps.allow_capabilities
                 .contains(&Capability::new("net:egress:*"))
         );
-        // free gates exec
+        // free has whitelisted exec commands
         assert!(
-            ps.gate_capabilities
+            ps.allow_capabilities
+                .contains(&Capability::new("exec:cmd:cat"))
+        );
+        assert!(
+            ps.allow_capabilities
+                .contains(&Capability::new("exec:cmd:grep"))
+        );
+        // exec:cmd:* wildcard is NOT in gate (unlisted commands → denied immediately)
+        assert!(
+            !ps.gate_capabilities
                 .contains(&Capability::new("exec:cmd:*"))
         );
     }
