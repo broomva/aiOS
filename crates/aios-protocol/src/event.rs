@@ -587,6 +587,22 @@ pub enum EventKind {
         final_score: f32,
     },
 
+    // ── Queue & steering (Phase 2.5) ──
+    Queued {
+        queue_id: String,
+        mode: SteeringMode,
+        message: String,
+    },
+    Steered {
+        queue_id: String,
+        /// Tool boundary where preemption occurred (e.g. "tool:read_file:call-3").
+        preempted_at: String,
+    },
+    QueueDrained {
+        queue_id: String,
+        processed: usize,
+    },
+
     // ── Error ──
     ErrorRaised {
         message: String,
@@ -669,6 +685,22 @@ pub enum PolicyDecisionKind {
     Allow,
     Deny,
     RequireApproval,
+}
+
+/// Steering mode for queued messages (Phase 2.5).
+///
+/// Determines how a queued message interacts with an active run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SteeringMode {
+    /// Queue message for processing after current run completes.
+    Collect,
+    /// Redirect agent at next tool boundary (safe preemption).
+    Steer,
+    /// Queue as follow-up to current run (same context).
+    Followup,
+    /// Interrupt at next safe point (tool boundary), highest priority.
+    Interrupt,
 }
 
 // ─── Forward-compatible deserializer ───────────────────────────────
@@ -1018,6 +1050,19 @@ enum EventKindKnown {
         total_generations: u32,
         total_trials: u32,
         final_score: f32,
+    },
+    Queued {
+        queue_id: String,
+        mode: SteeringMode,
+        message: String,
+    },
+    Steered {
+        queue_id: String,
+        preempted_at: String,
+    },
+    QueueDrained {
+        queue_id: String,
+        processed: usize,
     },
     ErrorRaised {
         message: String,
@@ -1530,6 +1575,29 @@ impl From<EventKindKnown> for EventKind {
                 total_generations,
                 total_trials,
                 final_score,
+            },
+            EventKindKnown::Queued {
+                queue_id,
+                mode,
+                message,
+            } => Self::Queued {
+                queue_id,
+                mode,
+                message,
+            },
+            EventKindKnown::Steered {
+                queue_id,
+                preempted_at,
+            } => Self::Steered {
+                queue_id,
+                preempted_at,
+            },
+            EventKindKnown::QueueDrained {
+                queue_id,
+                processed,
+            } => Self::QueueDrained {
+                queue_id,
+                processed,
             },
             EventKindKnown::ErrorRaised { message } => Self::ErrorRaised { message },
             EventKindKnown::Custom { event_type, data } => Self::Custom { event_type, data },

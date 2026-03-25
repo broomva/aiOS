@@ -183,9 +183,15 @@ mod tests {
         assert_eq!(ps.max_tool_runtime_secs, 30);
         assert_eq!(ps.max_events_per_turn, 15);
         // free allows net egress
-        assert!(ps.allow_capabilities.contains(&Capability::new("net:egress:*")));
+        assert!(
+            ps.allow_capabilities
+                .contains(&Capability::new("net:egress:*"))
+        );
         // free gates exec
-        assert!(ps.gate_capabilities.contains(&Capability::new("exec:cmd:*")));
+        assert!(
+            ps.gate_capabilities
+                .contains(&Capability::new("exec:cmd:*"))
+        );
     }
 
     #[test]

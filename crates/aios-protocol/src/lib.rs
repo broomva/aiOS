@@ -39,7 +39,7 @@ pub mod tool;
 pub use error::{KernelError, KernelResult};
 pub use event::{
     ActorType, ApprovalDecision, EventActor, EventEnvelope, EventKind, EventRecord, EventSchema,
-    LoopPhase, PolicyDecisionKind, RiskLevel, SnapshotType, SpanStatus, TokenUsage,
+    LoopPhase, PolicyDecisionKind, RiskLevel, SnapshotType, SpanStatus, SteeringMode, TokenUsage,
 };
 pub use identity::{AgentIdentityProvider, BasicIdentity};
 pub use ids::{
