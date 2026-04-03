@@ -11,6 +11,7 @@ description = "Canonical Agent OS runtime engine"
 aios-protocol = { path = "../aios-protocol", version = "0.2.0" }
 anyhow.workspace = true
 async-trait.workspace = true
+blake3 = "1.8"
 chrono.workspace = true
 hex.workspace = true
 parking_lot.workspace = true

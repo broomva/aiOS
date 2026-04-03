@@ -37,7 +37,7 @@ This repository implements a microkernel-style agent operating system where **se
 
 7. `aios-runtime`
 - Kernel loop and control plane.
-- Services: session manager, workspace bootstrap, ordered turn middleware chain, event emission, tool execution orchestration, checkpoint/heartbeat, homeostasis loop.
+- Services: session manager, workspace bootstrap, ordered turn middleware chain, middleware-installed tool-call guards, event emission, tool execution orchestration, checkpoint/heartbeat, homeostasis loop.
 - Depends on: `aios-model`, `aios-events`, `aios-tools`, `aios-memory`, `aios-policy`.
 
 8. `aios-kernel`
@@ -76,12 +76,13 @@ Each tick executes:
 2. `turn middleware chain` (ordered `TurnMiddleware::process(ctx, next)` composition)
 3. `sense` (phase events + budget instrumentation)
 4. `estimate` (state vector + operating mode event)
-5. `gate` (policy/approval)
-6. `execute` (tool dispatch in sandbox)
-7. `commit` (tool reports + file mutation events)
-8. `reflect` (observation extraction + memory write)
-9. `heartbeat` (budget update + checkpoint + state snapshot)
-10. `sleep` (await next external signal)
+5. `tool-call guards` (middleware-installed checks against provider-emitted tool calls before gate/execute)
+6. `gate` (policy/approval)
+7. `execute` (tool dispatch in sandbox)
+8. `commit` (tool reports + file mutation events)
+9. `reflect` (observation extraction + memory write)
+10. `heartbeat` (budget update + checkpoint + state snapshot)
+11. `sleep` (await next external signal)
 
 ## Homeostasis Model
 

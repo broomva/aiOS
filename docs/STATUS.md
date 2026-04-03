@@ -1,6 +1,6 @@
 # Status
 
-Last updated: 2026-04-02
+Last updated: 2026-04-03
 
 ## Build and Quality
 
@@ -27,6 +27,7 @@ Last updated: 2026-04-02
 15. Branch lifecycle hardening: fork-sequence bounds validation, merge-safety rules, and merged-branch read-only enforcement.
 16. Structured `tracing` spans across kernel/runtime/tool/sandbox/event-store boundaries for operator-grade execution visibility.
 17. Ordered turn middleware chain in `aios-runtime`, with mutable `TurnContext` and kernel-level coverage proving middleware can rewrite a turn before terminal execution.
+18. Loop detection middleware on the production runtime path, with per-session tool-call signature tracking, warning/hard-stop enforcement, and journaled loop-detection events.
 
 ## In Progress / Partial
 

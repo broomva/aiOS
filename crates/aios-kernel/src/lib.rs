@@ -286,7 +286,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use aios_protocol::{BranchId, Capability, EventKind, OperatingMode, PolicySet, ToolCall};
-    use aios_runtime::{TickOutput, TurnContext, TurnMiddleware, TurnNext};
+    use aios_runtime::{
+        LoopDetectionMiddleware, TickOutput, TurnContext, TurnMiddleware, TurnNext,
+    };
     use anyhow::Result;
     use async_trait::async_trait;
     use serde_json::json;
@@ -401,6 +403,150 @@ mod tests {
             assistant_message.as_deref(),
             Some("working on: middleware: original objective"),
         );
+
+        let _ = fs::remove_dir_all(root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loop_detection_allows_normal_tool_flow() -> Result<()> {
+        let root = unique_test_root("aios-kernel-loop-normal");
+        let kernel = KernelBuilder::new(&root)
+            .turn_middlewares(vec![Arc::new(LoopDetectionMiddleware::default())])
+            .build();
+
+        let policy = PolicySet {
+            allow_capabilities: vec![Capability::fs_write("/session/artifacts/**")],
+            gate_capabilities: vec![],
+            max_tool_runtime_secs: 10,
+            max_events_per_turn: 128,
+        };
+        let session = kernel.create_session("tester", policy, None).await?;
+
+        let first_call = ToolCall::new(
+            "fs.write",
+            json!({
+                "path": "artifacts/reports/first.txt",
+                "content": "one"
+            }),
+            vec![Capability::fs_write("/session/artifacts/**")],
+        );
+        let second_call = ToolCall::new(
+            "fs.write",
+            json!({
+                "path": "artifacts/reports/second.txt",
+                "content": "two"
+            }),
+            vec![Capability::fs_write("/session/artifacts/**")],
+        );
+
+        let _ = kernel
+            .tick(
+                &session.session_id,
+                "write first artifact",
+                Some(first_call),
+            )
+            .await?;
+        let _ = kernel
+            .tick(
+                &session.session_id,
+                "write second artifact",
+                Some(second_call),
+            )
+            .await?;
+
+        let events = kernel.read_events(&session.session_id, 1, 512).await?;
+        let loop_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.kind,
+                    EventKind::Custom { event_type, .. }
+                    if event_type.starts_with("loop_detection.")
+                )
+            })
+            .count();
+        let completed_calls = events
+            .iter()
+            .filter(|event| matches!(&event.kind, EventKind::ToolCallCompleted { .. }))
+            .count();
+
+        assert_eq!(loop_events, 0);
+        assert_eq!(completed_calls, 2);
+
+        let _ = fs::remove_dir_all(root).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loop_detection_warns_then_hard_stops_repeated_tool_calls() -> Result<()> {
+        let root = unique_test_root("aios-kernel-loop-detection");
+        let kernel = KernelBuilder::new(&root)
+            .turn_middlewares(vec![Arc::new(LoopDetectionMiddleware::default())])
+            .build();
+
+        let policy = PolicySet {
+            allow_capabilities: vec![Capability::fs_write("/session/artifacts/**")],
+            gate_capabilities: vec![],
+            max_tool_runtime_secs: 10,
+            max_events_per_turn: 128,
+        };
+        let session = kernel.create_session("tester", policy, None).await?;
+        let repeated_call = ToolCall::new(
+            "fs.write",
+            json!({
+                "path": "artifacts/reports/repeated.txt",
+                "content": "loop"
+            }),
+            vec![Capability::fs_write("/session/artifacts/**")],
+        );
+
+        for _ in 0..5 {
+            let _ = kernel
+                .tick(
+                    &session.session_id,
+                    "repeat the same tool call",
+                    Some(repeated_call.clone()),
+                )
+                .await?;
+        }
+
+        let events = kernel.read_events(&session.session_id, 1, 1024).await?;
+        let warning_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.kind,
+                    EventKind::Custom { event_type, .. }
+                    if event_type == "loop_detection.warning"
+                )
+            })
+            .count();
+        let hard_stop_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.kind,
+                    EventKind::Custom { event_type, .. }
+                    if event_type == "loop_detection.hard_stop"
+                )
+            })
+            .count();
+        let completed_calls = events
+            .iter()
+            .filter(|event| matches!(&event.kind, EventKind::ToolCallCompleted { .. }))
+            .count();
+        let hard_stop_message = events.iter().find_map(|event| match &event.kind {
+            EventKind::Message { role, content, .. } if role == "assistant" => content
+                .contains("Loop detection stopped")
+                .then(|| content.clone()),
+            _ => None,
+        });
+
+        assert_eq!(warning_events, 2);
+        assert_eq!(hard_stop_events, 1);
+        assert_eq!(completed_calls, 4);
+        assert!(hard_stop_message.is_some());
 
         let _ = fs::remove_dir_all(root).await;
         Ok(())

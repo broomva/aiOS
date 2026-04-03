@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -12,9 +12,11 @@ use aios_protocol::{
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use blake3::Hasher;
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::Serialize;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::sync::broadcast;
@@ -56,7 +58,7 @@ pub struct TickOutput {
     pub last_sequence: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TurnContext {
     pub session_id: SessionId,
     pub branch_id: BranchId,
@@ -65,6 +67,31 @@ pub struct TurnContext {
     pub state: AgentStateVector,
     pub pending_approvals: Vec<ApprovalTicket>,
     pub mode: OperatingMode,
+    pub tool_call_guards: Vec<Arc<dyn ToolCallGuard>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCallGuardDecision {
+    Allow,
+    Warn {
+        message: String,
+        repetitions: usize,
+        signature: String,
+    },
+    Block {
+        message: String,
+        repetitions: usize,
+        signature: String,
+    },
+}
+
+#[async_trait]
+pub trait ToolCallGuard: Send + Sync {
+    async fn on_tool_call(
+        &self,
+        ctx: &TurnContext,
+        call: &ToolCall,
+    ) -> Result<ToolCallGuardDecision>;
 }
 
 #[async_trait]
@@ -105,6 +132,126 @@ impl TurnMiddleware for PassthroughTurnMiddleware {
     async fn process(&self, ctx: &mut TurnContext, next: TurnNext<'_>) -> Result<TickOutput> {
         next.run(ctx).await
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct LoopDetectionConfig {
+    pub warning_threshold: usize,
+    pub hard_stop_limit: usize,
+    pub window_size: usize,
+}
+
+impl Default for LoopDetectionConfig {
+    fn default() -> Self {
+        Self {
+            warning_threshold: 3,
+            hard_stop_limit: 5,
+            window_size: 20,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct LoopDetectionMiddleware {
+    config: LoopDetectionConfig,
+    history_by_session: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
+}
+
+impl LoopDetectionMiddleware {
+    pub fn new(config: LoopDetectionConfig) -> Self {
+        Self {
+            config,
+            history_by_session: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn record_and_classify(&self, ctx: &TurnContext, call: &ToolCall) -> LoopObservation {
+        let signature = hash_tool_call_signature(call);
+        let session_key = ctx.session_id.as_str().to_owned();
+        let mut history_by_session = self.history_by_session.lock();
+        let history = history_by_session.entry(session_key).or_default();
+
+        let prior_repetitions = history
+            .iter()
+            .rev()
+            .take(self.config.window_size)
+            .take_while(|previous| *previous == &signature)
+            .count();
+        let repetitions = prior_repetitions + 1;
+
+        history.push_back(signature.clone());
+        while history.len() > self.config.window_size {
+            history.pop_front();
+        }
+
+        LoopObservation {
+            signature,
+            repetitions,
+        }
+    }
+}
+
+impl Default for LoopDetectionMiddleware {
+    fn default() -> Self {
+        Self::new(LoopDetectionConfig::default())
+    }
+}
+
+impl std::fmt::Debug for LoopDetectionMiddleware {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopDetectionMiddleware")
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl TurnMiddleware for LoopDetectionMiddleware {
+    async fn process(&self, ctx: &mut TurnContext, next: TurnNext<'_>) -> Result<TickOutput> {
+        ctx.tool_call_guards.push(Arc::new(self.clone()));
+        next.run(ctx).await
+    }
+}
+
+#[async_trait]
+impl ToolCallGuard for LoopDetectionMiddleware {
+    async fn on_tool_call(
+        &self,
+        ctx: &TurnContext,
+        call: &ToolCall,
+    ) -> Result<ToolCallGuardDecision> {
+        let observation = self.record_and_classify(ctx, call);
+
+        if observation.repetitions >= self.config.hard_stop_limit {
+            return Ok(ToolCallGuardDecision::Block {
+                message: format!(
+                    "Loop detection stopped repeated tool call `{}` after {} identical turns. Respond with text only and change approach.",
+                    call.tool_name, observation.repetitions
+                ),
+                repetitions: observation.repetitions,
+                signature: observation.signature,
+            });
+        }
+
+        if observation.repetitions >= self.config.warning_threshold {
+            return Ok(ToolCallGuardDecision::Warn {
+                message: format!(
+                    "Loop detection warning: tool call `{}` has repeated {} times in a row. Stop repeating it and explain the next step in text.",
+                    call.tool_name, observation.repetitions
+                ),
+                repetitions: observation.repetitions,
+                signature: observation.signature,
+            });
+        }
+
+        Ok(ToolCallGuardDecision::Allow)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LoopObservation {
+    signature: String,
+    repetitions: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +494,7 @@ impl KernelRuntime {
             state,
             pending_approvals,
             mode,
+            tool_call_guards: Vec::new(),
         };
 
         TurnNext::new(self, &self.turn_middlewares)
@@ -359,6 +507,16 @@ impl KernelRuntime {
         let branch_id = &ctx.branch_id;
         let manifest = &ctx.manifest;
         let input = &ctx.input;
+        let guard_context_template = TurnContext {
+            session_id: ctx.session_id.clone(),
+            branch_id: ctx.branch_id.clone(),
+            manifest: ctx.manifest.clone(),
+            input: ctx.input.clone(),
+            state: ctx.state.clone(),
+            pending_approvals: ctx.pending_approvals.clone(),
+            mode: ctx.mode,
+            tool_call_guards: ctx.tool_call_guards.clone(),
+        };
         let state = &mut ctx.state;
 
         let mut emitted = 0_u64;
@@ -487,6 +645,38 @@ impl KernelRuntime {
                             emitted += 1;
                         }
                         ModelDirective::ToolCall { call } => {
+                            let guard_ctx = TurnContext {
+                                session_id: guard_context_template.session_id.clone(),
+                                branch_id: guard_context_template.branch_id.clone(),
+                                manifest: guard_context_template.manifest.clone(),
+                                input: guard_context_template.input.clone(),
+                                state: state.clone(),
+                                pending_approvals: guard_context_template.pending_approvals.clone(),
+                                mode,
+                                tool_call_guards: guard_context_template.tool_call_guards.clone(),
+                            };
+                            if let Some(decision) =
+                                self.evaluate_tool_call_guards(&guard_ctx, &call).await?
+                            {
+                                emitted += self
+                                    .persist_loop_guard_event(
+                                        session_id, branch_id, &call, &decision,
+                                    )
+                                    .await?;
+                                emitted += self
+                                    .emit_guard_message(
+                                        session_id,
+                                        branch_id,
+                                        &decision,
+                                        Some(completion.model.clone()),
+                                    )
+                                    .await?;
+
+                                if matches!(decision, ToolCallGuardDecision::Block { .. }) {
+                                    continue;
+                                }
+                            }
+
                             emitted += self
                                 .emit_phase(session_id, branch_id, LoopPhase::Gate)
                                 .await?;
@@ -1298,6 +1488,108 @@ impl KernelRuntime {
         Ok(emitted)
     }
 
+    async fn evaluate_tool_call_guards(
+        &self,
+        ctx: &TurnContext,
+        call: &ToolCall,
+    ) -> Result<Option<ToolCallGuardDecision>> {
+        let mut warning: Option<ToolCallGuardDecision> = None;
+
+        for guard in &ctx.tool_call_guards {
+            match guard.on_tool_call(ctx, call).await? {
+                ToolCallGuardDecision::Allow => {}
+                decision @ ToolCallGuardDecision::Warn { .. } => {
+                    warning = Some(decision);
+                }
+                decision @ ToolCallGuardDecision::Block { .. } => {
+                    return Ok(Some(decision));
+                }
+            }
+        }
+
+        Ok(warning)
+    }
+
+    async fn persist_loop_guard_event(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        call: &ToolCall,
+        decision: &ToolCallGuardDecision,
+    ) -> Result<u64> {
+        let (event_type, message, repetitions, signature) = match decision {
+            ToolCallGuardDecision::Warn {
+                message,
+                repetitions,
+                signature,
+            } => (
+                "loop_detection.warning",
+                message.as_str(),
+                *repetitions as u64,
+                signature.as_str(),
+            ),
+            ToolCallGuardDecision::Block {
+                message,
+                repetitions,
+                signature,
+            } => (
+                "loop_detection.hard_stop",
+                message.as_str(),
+                *repetitions as u64,
+                signature.as_str(),
+            ),
+            ToolCallGuardDecision::Allow => return Ok(0),
+        };
+
+        self.append_event(
+            session_id,
+            branch_id,
+            EventKind::Custom {
+                event_type: event_type.to_owned(),
+                data: serde_json::json!({
+                    "tool_name": call.tool_name,
+                    "call_id": call.call_id,
+                    "signature": signature,
+                    "message": message,
+                    "repetitions": repetitions,
+                }),
+            },
+        )
+        .await?;
+
+        Ok(1)
+    }
+
+    async fn emit_guard_message(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        decision: &ToolCallGuardDecision,
+        model: Option<String>,
+    ) -> Result<u64> {
+        let (role, content) = match decision {
+            ToolCallGuardDecision::Warn { message, .. } => ("system".to_owned(), message.clone()),
+            ToolCallGuardDecision::Block { message, .. } => {
+                ("assistant".to_owned(), message.clone())
+            }
+            ToolCallGuardDecision::Allow => return Ok(0),
+        };
+
+        self.append_event(
+            session_id,
+            branch_id,
+            EventKind::Message {
+                role,
+                content,
+                model,
+                token_usage: None,
+            },
+        )
+        .await?;
+
+        Ok(1)
+    }
+
     async fn emit_phase(
         &self,
         session_id: &SessionId,
@@ -1732,6 +2024,39 @@ fn extract_observation(event: &EventRecord) -> Option<aios_protocol::Observation
 fn sha256_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex::encode(digest)
+}
+
+fn hash_tool_call_signature(call: &ToolCall) -> String {
+    let payload = serde_json::json!({
+        "tool_name": call.tool_name,
+        "input": normalize_json_value(&call.input),
+    });
+    let serialized = serde_json::to_vec(&payload).unwrap_or_default();
+    let mut hasher = Hasher::new();
+    hasher.update(&serialized);
+    hasher.finalize().to_hex().to_string()
+}
+
+fn normalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let normalized = keys
+                .into_iter()
+                .map(|key| {
+                    let normalized_value = map
+                        .get(&key)
+                        .map(normalize_json_value)
+                        .unwrap_or(Value::Null);
+                    (key, normalized_value)
+                })
+                .collect::<Map<String, Value>>();
+            Value::Object(normalized)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(normalize_json_value).collect()),
+        _ => value.clone(),
+    }
 }
 
 fn event_kind_name(kind: &EventKind) -> &'static str {
