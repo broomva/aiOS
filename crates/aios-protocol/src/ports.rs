@@ -36,6 +36,17 @@ pub struct ModelCompletionRequest {
     /// Tool whitelist from active skill. When set, only these tools are sent to the LLM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+    /// Conversation history from prior turns in this session.
+    /// Built by the runtime from the event journal before each provider call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conversation_history: Vec<ConversationTurn>,
+}
+
+/// A single turn in the conversation history (user message + assistant response).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurn {
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

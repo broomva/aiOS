@@ -336,6 +336,13 @@ impl KernelRuntime {
             .await?;
         emitted += 1;
 
+        // Build conversation history from prior events in this session.
+        // This reconstructs user objectives and assistant responses so the LLM
+        // has multi-turn context.
+        let conversation_history = self
+            .build_conversation_history(session_id, branch_id)
+            .await;
+
         let completion = if let Some(call) = input.proposed_tool.clone() {
             Ok(aios_protocol::ModelCompletion {
                 provider: "inline-proposed-tool".to_owned(),
@@ -356,6 +363,7 @@ impl KernelRuntime {
                     proposed_tool: None,
                     system_prompt: input.system_prompt.clone(),
                     allowed_tools: input.allowed_tools.clone(),
+                    conversation_history,
                 })
                 .await
                 .map_err(|error| anyhow::anyhow!(error.to_string()))
@@ -933,6 +941,94 @@ impl KernelRuntime {
             .read(session_id.clone(), branch_id.clone(), from_sequence, limit)
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))
+    }
+
+    /// Build conversation history from the session's event journal.
+    ///
+    /// Reads prior events and extracts user objectives (from `DeliberationProposed`)
+    /// and assistant responses (from `Message` with role=assistant, or aggregated
+    /// `TextDelta` events). Returns a list of `ConversationTurn` entries in
+    /// chronological order, capped at the most recent 50 turns to avoid
+    /// context overflow.
+    async fn build_conversation_history(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+    ) -> Vec<aios_protocol::ConversationTurn> {
+        let events = match self
+            .event_store
+            .read(session_id.clone(), branch_id.clone(), 0, 10_000)
+            .await
+        {
+            Ok(events) => events,
+            Err(err) => {
+                debug!(%err, "failed to read events for conversation history");
+                return Vec::new();
+            }
+        };
+
+        let mut turns = Vec::new();
+        let mut current_assistant_text = String::new();
+
+        for record in &events {
+            match &record.kind {
+                EventKind::DeliberationProposed { summary, .. } => {
+                    // Flush any pending assistant text before the next user turn.
+                    if !current_assistant_text.is_empty() {
+                        turns.push(aios_protocol::ConversationTurn {
+                            role: "assistant".to_owned(),
+                            content: std::mem::take(&mut current_assistant_text),
+                        });
+                    }
+                    if !summary.is_empty() {
+                        turns.push(aios_protocol::ConversationTurn {
+                            role: "user".to_owned(),
+                            content: summary.clone(),
+                        });
+                    }
+                }
+                EventKind::Message {
+                    role, content, ..
+                } if role == "assistant" => {
+                    current_assistant_text.push_str(content);
+                }
+                EventKind::TextDelta { delta, .. } => {
+                    current_assistant_text.push_str(delta);
+                }
+                EventKind::RunFinished { final_answer, .. } => {
+                    // If we have a final answer and no accumulated text, use it.
+                    if current_assistant_text.is_empty() {
+                        if let Some(answer) = final_answer {
+                            current_assistant_text = answer.clone();
+                        }
+                    }
+                    // Flush assistant text at run boundary.
+                    if !current_assistant_text.is_empty() {
+                        turns.push(aios_protocol::ConversationTurn {
+                            role: "assistant".to_owned(),
+                            content: std::mem::take(&mut current_assistant_text),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Flush any remaining assistant text.
+        if !current_assistant_text.is_empty() {
+            turns.push(aios_protocol::ConversationTurn {
+                role: "assistant".to_owned(),
+                content: current_assistant_text,
+            });
+        }
+
+        // Cap to most recent 50 turns to avoid context overflow.
+        let max_turns = 50;
+        if turns.len() > max_turns {
+            turns.drain(..turns.len() - max_turns);
+        }
+
+        turns
     }
 
     fn estimate_mode(&self, state: &AgentStateVector, pending_approvals: usize) -> OperatingMode {

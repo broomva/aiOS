@@ -57,7 +57,7 @@ pub use ports::{
     ApprovalPort, ApprovalRequest, ApprovalResolution, ApprovalTicket, EventRecordStream,
     EventStorePort, ModelCompletion, ModelCompletionRequest, ModelDirective, ModelProviderPort,
     ModelStopReason, PolicyGateDecision, PolicyGatePort, ToolExecutionReport, ToolExecutionRequest,
-    ToolHarnessPort,
+    ToolHarnessPort, ConversationTurn,
 };
 pub use sandbox::{NetworkPolicy, SandboxLimits, SandboxTier};
 pub use session::{
