@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Execution sandboxing for Agent OS tool invocation"
 
 [dependencies]
-aios-protocol = { path = "../aios-protocol", version = "0.2.0" }
+aios-protocol = { path = "../aios-protocol", version = "0.3.0" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

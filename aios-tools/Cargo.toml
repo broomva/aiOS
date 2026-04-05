@@ -8,9 +8,9 @@ repository.workspace = true
 description = "Tool registry and governance for Agent OS"
 
 [dependencies]
-aios-protocol = { path = "../aios-protocol", version = "0.2.0" }
-aios-policy = { path = "../aios-policy", version = "0.2.0" }
-aios-sandbox = { path = "../aios-sandbox", version = "0.2.0" }
+aios-protocol = { path = "../aios-protocol", version = "0.3.0" }
+aios-policy = { path = "../aios-policy", version = "0.3.0" }
+aios-sandbox = { path = "../aios-sandbox", version = "0.3.0" }
 anyhow.workspace = true
 async-trait.workspace = true
 indexmap.workspace = true
