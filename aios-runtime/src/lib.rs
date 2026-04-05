@@ -593,9 +593,7 @@ impl KernelRuntime {
         // Build conversation history from prior events in this session.
         // This reconstructs user objectives and assistant responses so the LLM
         // has multi-turn context.
-        let conversation_history = self
-            .build_conversation_history(session_id, branch_id)
-            .await;
+        let conversation_history = self.build_conversation_history(session_id, branch_id).await;
 
         let completion = if let Some(call) = input.proposed_tool.clone() {
             Ok(aios_protocol::ModelCompletion {
@@ -1274,9 +1272,7 @@ impl KernelRuntime {
                         });
                     }
                 }
-                EventKind::Message {
-                    role, content, ..
-                } if role == "assistant" => {
+                EventKind::Message { role, content, .. } if role == "assistant" => {
                     current_assistant_text.push_str(content);
                 }
                 EventKind::TextDelta { delta, .. } => {
