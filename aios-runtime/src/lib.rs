@@ -1280,10 +1280,10 @@ impl KernelRuntime {
                 }
                 EventKind::RunFinished { final_answer, .. } => {
                     // If we have a final answer and no accumulated text, use it.
-                    if current_assistant_text.is_empty() {
-                        if let Some(answer) = final_answer {
-                            current_assistant_text = answer.clone();
-                        }
+                    if current_assistant_text.is_empty()
+                        && let Some(answer) = final_answer
+                    {
+                        current_assistant_text = answer.clone();
                     }
                     // Flush assistant text at run boundary.
                     if !current_assistant_text.is_empty() {
