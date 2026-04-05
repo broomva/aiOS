@@ -785,7 +785,11 @@ impl KernelRuntime {
                                 Ok(report) => {
                                     emitted += self
                                         .record_tool_report(
-                                            session_id, branch_id, manifest, &report,
+                                            session_id,
+                                            branch_id,
+                                            manifest,
+                                            &report,
+                                            Some(call.call_id.clone()),
                                         )
                                         .await?;
                                     if let ToolOutcome::Success { output } = &report.outcome
@@ -1479,6 +1483,7 @@ impl KernelRuntime {
         branch_id: &BranchId,
         manifest: &SessionManifest,
         report: &ToolExecutionReport,
+        call_id: Option<String>,
     ) -> Result<u64> {
         let mut emitted = 0;
 
@@ -1505,7 +1510,7 @@ impl KernelRuntime {
             branch_id,
             EventKind::ToolCallCompleted {
                 tool_run_id: report.tool_run_id.clone(),
-                call_id: None,
+                call_id,
                 tool_name: report.tool_name.clone(),
                 result: result_value,
                 duration_ms: 0,
