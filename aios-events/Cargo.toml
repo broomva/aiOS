@@ -1,0 +1,23 @@
+[package]
+name = "aios-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Event types and streaming for the Agent OS"
+
+[dependencies]
+aios-protocol = { path = "../aios-protocol", version = "0.2.0" }
+anyhow.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+futures-util.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

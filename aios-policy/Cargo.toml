@@ -1,0 +1,20 @@
+[package]
+name = "aios-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Policy engine and capability-based authorization for Agent OS"
+
+[dependencies]
+aios-protocol = { path = "../aios-protocol", version = "0.2.0" }
+async-trait.workspace = true
+chrono.workspace = true
+indexmap.workspace = true
+serde.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

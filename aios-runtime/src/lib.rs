@@ -1,0 +1,2192 @@
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use aios_protocol::{
+    AgentStateVector, ApprovalDecision, ApprovalId, ApprovalPort, ApprovalRequest, ApprovalTicket,
+    BranchId, BranchInfo, BranchMergeResult, BudgetState, CheckpointId, CheckpointManifest,
+    EventKind, EventRecord, EventStorePort, FileProvenance, LoopPhase, ModelCompletionRequest,
+    ModelDirective, ModelProviderPort, ModelRouting, OperatingMode, PolicyGatePort, PolicySet,
+    RiskLevel, RunId, SessionId, SessionManifest, SpanStatus, ToolCall, ToolExecutionReport,
+    ToolExecutionRequest, ToolHarnessPort, ToolOutcome,
+};
+use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
+use blake3::Hasher;
+use chrono::Utc;
+use parking_lot::Mutex;
+use serde::Serialize;
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use tokio::fs;
+use tokio::sync::broadcast;
+use tracing::{Instrument, debug, info, instrument, warn};
+
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub root: PathBuf,
+    pub checkpoint_every_ticks: u64,
+    pub circuit_breaker_errors: u32,
+}
+
+impl RuntimeConfig {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            checkpoint_every_ticks: 1,
+            circuit_breaker_errors: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TickInput {
+    pub objective: String,
+    pub proposed_tool: Option<ToolCall>,
+    /// Optional per-request system prompt (active skill body, liquid prompt).
+    pub system_prompt: Option<String>,
+    /// Tool whitelist from active skill. When set, only these tools are sent to the LLM.
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TickOutput {
+    pub session_id: SessionId,
+    pub mode: OperatingMode,
+    pub state: AgentStateVector,
+    pub events_emitted: u64,
+    pub last_sequence: u64,
+}
+
+#[derive(Clone)]
+pub struct TurnContext {
+    pub session_id: SessionId,
+    pub branch_id: BranchId,
+    pub manifest: SessionManifest,
+    pub input: TickInput,
+    pub state: AgentStateVector,
+    pub pending_approvals: Vec<ApprovalTicket>,
+    pub mode: OperatingMode,
+    pub tool_call_guards: Vec<Arc<dyn ToolCallGuard>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCallGuardDecision {
+    Allow,
+    Warn {
+        message: String,
+        repetitions: usize,
+        signature: String,
+    },
+    Block {
+        message: String,
+        repetitions: usize,
+        signature: String,
+    },
+}
+
+#[async_trait]
+pub trait ToolCallGuard: Send + Sync {
+    async fn on_tool_call(
+        &self,
+        ctx: &TurnContext,
+        call: &ToolCall,
+    ) -> Result<ToolCallGuardDecision>;
+}
+
+#[async_trait]
+pub trait TurnMiddleware: Send + Sync {
+    async fn process(&self, ctx: &mut TurnContext, next: TurnNext<'_>) -> Result<TickOutput>;
+}
+
+pub struct TurnNext<'a> {
+    runtime: &'a KernelRuntime,
+    middlewares: &'a [Arc<dyn TurnMiddleware>],
+}
+
+impl<'a> TurnNext<'a> {
+    fn new(runtime: &'a KernelRuntime, middlewares: &'a [Arc<dyn TurnMiddleware>]) -> Self {
+        Self {
+            runtime,
+            middlewares,
+        }
+    }
+
+    pub async fn run(self, ctx: &mut TurnContext) -> Result<TickOutput> {
+        match self.middlewares.split_first() {
+            Some((middleware, remaining)) => {
+                middleware
+                    .process(ctx, TurnNext::new(self.runtime, remaining))
+                    .await
+            }
+            None => self.runtime.execute_turn(ctx).await,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct PassthroughTurnMiddleware;
+
+#[async_trait]
+impl TurnMiddleware for PassthroughTurnMiddleware {
+    async fn process(&self, ctx: &mut TurnContext, next: TurnNext<'_>) -> Result<TickOutput> {
+        next.run(ctx).await
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LoopDetectionConfig {
+    pub warning_threshold: usize,
+    pub hard_stop_limit: usize,
+    pub window_size: usize,
+}
+
+impl Default for LoopDetectionConfig {
+    fn default() -> Self {
+        Self {
+            warning_threshold: 3,
+            hard_stop_limit: 5,
+            window_size: 20,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct LoopDetectionMiddleware {
+    config: LoopDetectionConfig,
+    history_by_session: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
+}
+
+impl LoopDetectionMiddleware {
+    pub fn new(config: LoopDetectionConfig) -> Self {
+        Self {
+            config,
+            history_by_session: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn record_and_classify(&self, ctx: &TurnContext, call: &ToolCall) -> LoopObservation {
+        let signature = hash_tool_call_signature(call);
+        let session_key = ctx.session_id.as_str().to_owned();
+        let mut history_by_session = self.history_by_session.lock();
+        let history = history_by_session.entry(session_key).or_default();
+
+        let prior_repetitions = history
+            .iter()
+            .rev()
+            .take(self.config.window_size)
+            .take_while(|previous| *previous == &signature)
+            .count();
+        let repetitions = prior_repetitions + 1;
+
+        history.push_back(signature.clone());
+        while history.len() > self.config.window_size {
+            history.pop_front();
+        }
+
+        LoopObservation {
+            signature,
+            repetitions,
+        }
+    }
+}
+
+impl Default for LoopDetectionMiddleware {
+    fn default() -> Self {
+        Self::new(LoopDetectionConfig::default())
+    }
+}
+
+impl std::fmt::Debug for LoopDetectionMiddleware {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopDetectionMiddleware")
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl TurnMiddleware for LoopDetectionMiddleware {
+    async fn process(&self, ctx: &mut TurnContext, next: TurnNext<'_>) -> Result<TickOutput> {
+        ctx.tool_call_guards.push(Arc::new(self.clone()));
+        next.run(ctx).await
+    }
+}
+
+#[async_trait]
+impl ToolCallGuard for LoopDetectionMiddleware {
+    async fn on_tool_call(
+        &self,
+        ctx: &TurnContext,
+        call: &ToolCall,
+    ) -> Result<ToolCallGuardDecision> {
+        let observation = self.record_and_classify(ctx, call);
+
+        if observation.repetitions >= self.config.hard_stop_limit {
+            return Ok(ToolCallGuardDecision::Block {
+                message: format!(
+                    "Loop detection stopped repeated tool call `{}` after {} identical turns. Respond with text only and change approach.",
+                    call.tool_name, observation.repetitions
+                ),
+                repetitions: observation.repetitions,
+                signature: observation.signature,
+            });
+        }
+
+        if observation.repetitions >= self.config.warning_threshold {
+            return Ok(ToolCallGuardDecision::Warn {
+                message: format!(
+                    "Loop detection warning: tool call `{}` has repeated {} times in a row. Stop repeating it and explain the next step in text.",
+                    call.tool_name, observation.repetitions
+                ),
+                repetitions: observation.repetitions,
+                signature: observation.signature,
+            });
+        }
+
+        Ok(ToolCallGuardDecision::Allow)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LoopObservation {
+    signature: String,
+    repetitions: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SessionRuntimeState {
+    manifest: SessionManifest,
+    next_sequence_by_branch: HashMap<BranchId, u64>,
+    branches: HashMap<BranchId, BranchRuntimeState>,
+    tick_count: u64,
+    mode: OperatingMode,
+    state_vector: AgentStateVector,
+}
+
+#[derive(Debug, Clone)]
+struct BranchRuntimeState {
+    parent_branch: Option<BranchId>,
+    fork_sequence: u64,
+    head_sequence: u64,
+    merged_into: Option<BranchId>,
+}
+
+#[derive(Clone)]
+pub struct KernelRuntime {
+    config: RuntimeConfig,
+    event_store: Arc<dyn EventStorePort>,
+    provider: Arc<dyn ModelProviderPort>,
+    tool_harness: Arc<dyn ToolHarnessPort>,
+    approvals: Arc<dyn ApprovalPort>,
+    policy_gate: Arc<dyn PolicyGatePort>,
+    turn_middlewares: Vec<Arc<dyn TurnMiddleware>>,
+    stream: broadcast::Sender<EventRecord>,
+    sessions: Arc<Mutex<HashMap<String, SessionRuntimeState>>>,
+}
+
+impl KernelRuntime {
+    pub fn new(
+        config: RuntimeConfig,
+        event_store: Arc<dyn EventStorePort>,
+        provider: Arc<dyn ModelProviderPort>,
+        tool_harness: Arc<dyn ToolHarnessPort>,
+        approvals: Arc<dyn ApprovalPort>,
+        policy_gate: Arc<dyn PolicyGatePort>,
+    ) -> Self {
+        Self::with_turn_middlewares(
+            config,
+            event_store,
+            provider,
+            tool_harness,
+            approvals,
+            policy_gate,
+            Vec::new(),
+        )
+    }
+
+    pub fn with_turn_middlewares(
+        config: RuntimeConfig,
+        event_store: Arc<dyn EventStorePort>,
+        provider: Arc<dyn ModelProviderPort>,
+        tool_harness: Arc<dyn ToolHarnessPort>,
+        approvals: Arc<dyn ApprovalPort>,
+        policy_gate: Arc<dyn PolicyGatePort>,
+        turn_middlewares: Vec<Arc<dyn TurnMiddleware>>,
+    ) -> Self {
+        let (stream, _) = broadcast::channel(2048);
+        Self {
+            config,
+            event_store,
+            provider,
+            tool_harness,
+            approvals,
+            policy_gate,
+            turn_middlewares,
+            stream,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[instrument(skip(self, owner, policy, model_routing))]
+    pub async fn create_session(
+        &self,
+        owner: impl Into<String>,
+        policy: PolicySet,
+        model_routing: ModelRouting,
+    ) -> Result<SessionManifest> {
+        self.create_session_with_id(SessionId::default(), owner, policy, model_routing)
+            .await
+    }
+
+    #[instrument(skip(self, owner, policy, model_routing), fields(session_id = %session_id))]
+    pub async fn create_session_with_id(
+        &self,
+        session_id: SessionId,
+        owner: impl Into<String>,
+        policy: PolicySet,
+        model_routing: ModelRouting,
+    ) -> Result<SessionManifest> {
+        if let Some(existing) = self.sessions.lock().get(session_id.as_str()) {
+            return Ok(existing.manifest.clone());
+        }
+
+        let owner = owner.into();
+        let session_root = self.session_root(&session_id);
+        self.initialize_workspace(session_root.as_path()).await?;
+
+        let manifest = SessionManifest {
+            session_id: session_id.clone(),
+            owner,
+            created_at: Utc::now(),
+            workspace_root: session_root.to_string_lossy().into_owned(),
+            model_routing,
+            policy: serde_json::to_value(&policy).unwrap_or_default(),
+        };
+
+        self.write_pretty_json(session_root.join("manifest.json"), &manifest)
+            .await?;
+
+        let manifest_hash = sha256_json(&manifest)?;
+
+        let main_branch = BranchId::main();
+        let latest_sequence = self
+            .event_store
+            .head(session_id.clone(), main_branch.clone())
+            .await
+            .unwrap_or(0);
+        let mut next_sequence_by_branch = HashMap::new();
+        next_sequence_by_branch.insert(main_branch.clone(), latest_sequence + 1);
+        let mut branches = HashMap::new();
+        branches.insert(
+            main_branch.clone(),
+            BranchRuntimeState {
+                parent_branch: None,
+                fork_sequence: 0,
+                head_sequence: latest_sequence,
+                merged_into: None,
+            },
+        );
+        self.sessions.lock().insert(
+            session_id.as_str().to_owned(),
+            SessionRuntimeState {
+                manifest: manifest.clone(),
+                next_sequence_by_branch,
+                branches,
+                tick_count: 0,
+                mode: OperatingMode::Explore,
+                state_vector: AgentStateVector::default(),
+            },
+        );
+        self.policy_gate
+            .set_policy(session_id.clone(), policy)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+        if latest_sequence == 0 {
+            self.append_event(
+                &session_id,
+                &main_branch,
+                EventKind::SessionCreated {
+                    name: manifest_hash.clone(),
+                    config: serde_json::json!({ "manifest_hash": manifest_hash }),
+                },
+            )
+            .await?;
+
+            self.emit_phase(&session_id, &main_branch, LoopPhase::Sleep)
+                .await?;
+
+            info!(
+                session_id = %session_id,
+                workspace_root = %manifest.workspace_root,
+                "session created"
+            );
+        } else {
+            info!(
+                session_id = %session_id,
+                workspace_root = %manifest.workspace_root,
+                latest_sequence,
+                "session attached to existing event stream"
+            );
+        }
+
+        Ok(manifest)
+    }
+
+    pub fn session_exists(&self, session_id: &SessionId) -> bool {
+        self.sessions.lock().contains_key(session_id.as_str())
+    }
+
+    /// List all in-memory sessions with summary metadata.
+    pub fn list_sessions(&self) -> Vec<SessionManifest> {
+        let sessions = self.sessions.lock();
+        sessions
+            .values()
+            .map(|state| state.manifest.clone())
+            .collect()
+    }
+
+    pub fn root_path(&self) -> &Path {
+        &self.config.root
+    }
+
+    pub async fn tick(&self, session_id: &SessionId, input: TickInput) -> Result<TickOutput> {
+        self.tick_on_branch(session_id, &BranchId::main(), input)
+            .await
+    }
+
+    #[instrument(
+        skip(self, input),
+        fields(
+            session_id = %session_id,
+            branch = %branch_id.as_str(),
+            objective_len = input.objective.len(),
+            has_tool = input.proposed_tool.is_some()
+        )
+    )]
+    pub async fn tick_on_branch(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        input: TickInput,
+    ) -> Result<TickOutput> {
+        let (manifest, state) = {
+            let sessions = self.sessions.lock();
+            let session = sessions
+                .get(session_id.as_str())
+                .with_context(|| format!("session not found: {session_id}"))?;
+            (session.manifest.clone(), session.state_vector.clone())
+        };
+
+        let pending_approvals = self
+            .approvals
+            .list_pending(session_id.clone())
+            .await
+            .unwrap_or_default();
+        let mode = self.estimate_mode(&state, pending_approvals.len());
+
+        let mut ctx = TurnContext {
+            session_id: session_id.clone(),
+            branch_id: branch_id.clone(),
+            manifest,
+            input,
+            state,
+            pending_approvals,
+            mode,
+            tool_call_guards: Vec::new(),
+        };
+
+        TurnNext::new(self, &self.turn_middlewares)
+            .run(&mut ctx)
+            .await
+    }
+
+    async fn execute_turn(&self, ctx: &mut TurnContext) -> Result<TickOutput> {
+        let session_id = &ctx.session_id;
+        let branch_id = &ctx.branch_id;
+        let manifest = &ctx.manifest;
+        let input = &ctx.input;
+        let guard_context_template = TurnContext {
+            session_id: ctx.session_id.clone(),
+            branch_id: ctx.branch_id.clone(),
+            manifest: ctx.manifest.clone(),
+            input: ctx.input.clone(),
+            state: ctx.state.clone(),
+            pending_approvals: ctx.pending_approvals.clone(),
+            mode: ctx.mode,
+            tool_call_guards: ctx.tool_call_guards.clone(),
+        };
+        let state = &mut ctx.state;
+
+        let mut emitted = 0_u64;
+        let mut previous_mode = Some(ctx.mode);
+        let mut _tool_calls_this_tick = 0_u32;
+        let mut _file_mutations_this_tick = 0_u32;
+        let mut mode = ctx.mode;
+
+        emitted += self
+            .emit_phase(session_id, branch_id, LoopPhase::Perceive)
+            .await?;
+
+        // Record initial budget metrics during the Perceive phase.
+        {
+            let metrics = life_vigil::metrics::GenAiMetrics::new("arcan");
+            metrics.record_budget(
+                state.budget.tokens_remaining,
+                state.budget.cost_remaining_usd,
+            );
+        }
+
+        emitted += self
+            .emit_phase(session_id, branch_id, LoopPhase::Deliberate)
+            .await?;
+
+        self.append_event(
+            session_id,
+            branch_id,
+            EventKind::DeliberationProposed {
+                summary: input.objective.clone(),
+                proposed_tool: input.proposed_tool.as_ref().map(|c| c.tool_name.clone()),
+            },
+        )
+        .await?;
+        emitted += 1;
+
+        self.append_event(
+            session_id,
+            branch_id,
+            EventKind::StateEstimated {
+                state: (*state).clone(),
+                mode,
+            },
+        )
+        .await?;
+        emitted += 1;
+        debug!(mode = ?mode, uncertainty = state.uncertainty, "state estimated");
+
+        if matches!(mode, OperatingMode::AskHuman | OperatingMode::Sleep) {
+            emitted += self
+                .finalize_tick(session_id, branch_id, manifest, state, &mode)
+                .await?;
+            ctx.mode = mode;
+            return self
+                .current_tick_output(session_id, branch_id, mode, (*state).clone(), emitted)
+                .await;
+        }
+
+        let run_id = RunId::default();
+        self.append_event(
+            session_id,
+            branch_id,
+            EventKind::RunStarted {
+                provider: "canonical".to_owned(),
+                max_iterations: 1,
+            },
+        )
+        .await?;
+        emitted += 1;
+        self.append_event(session_id, branch_id, EventKind::StepStarted { index: 0 })
+            .await?;
+        emitted += 1;
+
+        // Build conversation history from prior events in this session.
+        // This reconstructs user objectives and assistant responses so the LLM
+        // has multi-turn context.
+        let conversation_history = self
+            .build_conversation_history(session_id, branch_id)
+            .await;
+
+        let completion = if let Some(call) = input.proposed_tool.clone() {
+            Ok(aios_protocol::ModelCompletion {
+                provider: "inline-proposed-tool".to_owned(),
+                model: "inline".to_owned(),
+                directives: vec![ModelDirective::ToolCall { call }],
+                stop_reason: aios_protocol::ModelStopReason::ToolCall,
+                usage: None,
+                final_answer: None,
+            })
+        } else {
+            self.provider
+                .complete(ModelCompletionRequest {
+                    session_id: session_id.clone(),
+                    branch_id: branch_id.clone(),
+                    run_id: run_id.clone(),
+                    step_index: 0,
+                    objective: input.objective.clone(),
+                    proposed_tool: None,
+                    system_prompt: input.system_prompt.clone(),
+                    allowed_tools: input.allowed_tools.clone(),
+                    conversation_history,
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+        };
+
+        match completion {
+            Ok(completion) => {
+                let mut directive_count = 0_usize;
+                for directive in completion.directives {
+                    directive_count += 1;
+                    match directive {
+                        ModelDirective::TextDelta { delta, index } => {
+                            self.append_event(
+                                session_id,
+                                branch_id,
+                                EventKind::TextDelta { delta, index },
+                            )
+                            .await?;
+                            emitted += 1;
+                        }
+                        ModelDirective::Message { role, content } => {
+                            self.append_event(
+                                session_id,
+                                branch_id,
+                                EventKind::Message {
+                                    role,
+                                    content,
+                                    model: Some(completion.model.clone()),
+                                    token_usage: completion.usage,
+                                },
+                            )
+                            .await?;
+                            emitted += 1;
+                        }
+                        ModelDirective::ToolCall { call } => {
+                            let guard_ctx = TurnContext {
+                                session_id: guard_context_template.session_id.clone(),
+                                branch_id: guard_context_template.branch_id.clone(),
+                                manifest: guard_context_template.manifest.clone(),
+                                input: guard_context_template.input.clone(),
+                                state: state.clone(),
+                                pending_approvals: guard_context_template.pending_approvals.clone(),
+                                mode,
+                                tool_call_guards: guard_context_template.tool_call_guards.clone(),
+                            };
+                            if let Some(decision) =
+                                self.evaluate_tool_call_guards(&guard_ctx, &call).await?
+                            {
+                                emitted += self
+                                    .persist_loop_guard_event(
+                                        session_id, branch_id, &call, &decision,
+                                    )
+                                    .await?;
+                                emitted += self
+                                    .emit_guard_message(
+                                        session_id,
+                                        branch_id,
+                                        &decision,
+                                        Some(completion.model.clone()),
+                                    )
+                                    .await?;
+
+                                if matches!(decision, ToolCallGuardDecision::Block { .. }) {
+                                    continue;
+                                }
+                            }
+
+                            emitted += self
+                                .emit_phase(session_id, branch_id, LoopPhase::Gate)
+                                .await?;
+                            self.append_event(
+                                session_id,
+                                branch_id,
+                                EventKind::ToolCallRequested {
+                                    call_id: call.call_id.clone(),
+                                    tool_name: call.tool_name.clone(),
+                                    arguments: call.input.clone(),
+                                    category: None,
+                                },
+                            )
+                            .await?;
+                            emitted += 1;
+
+                            let policy = self
+                                .policy_gate
+                                .evaluate(session_id.clone(), call.requested_capabilities.clone())
+                                .await
+                                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+                            // Track tool calls for per-tick Autonomic limits.
+                            _tool_calls_this_tick += 1;
+                            if !policy.denied.is_empty() {
+                                mode = OperatingMode::Recover;
+                                state.error_streak += 1;
+                                state.uncertainty = (state.uncertainty + 0.15).min(1.0);
+                                state.budget.error_budget_remaining =
+                                    state.budget.error_budget_remaining.saturating_sub(1);
+                                self.append_event(
+                                    session_id,
+                                    branch_id,
+                                    EventKind::ToolCallFailed {
+                                        call_id: call.call_id.clone(),
+                                        tool_name: call.tool_name.clone(),
+                                        error: format!(
+                                            "capabilities denied: {}",
+                                            policy
+                                                .denied
+                                                .iter()
+                                                .map(|capability| capability.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(",")
+                                        ),
+                                    },
+                                )
+                                .await?;
+                                emitted += 1;
+                                continue;
+                            }
+
+                            if !policy.requires_approval.is_empty() {
+                                mode = OperatingMode::AskHuman;
+                                for capability in policy.requires_approval {
+                                    let ticket = self
+                                        .approvals
+                                        .enqueue(ApprovalRequest {
+                                            session_id: session_id.clone(),
+                                            call_id: call.call_id.clone(),
+                                            tool_name: call.tool_name.clone(),
+                                            capability: capability.clone(),
+                                            reason: format!(
+                                                "approval required for tool {}",
+                                                call.tool_name
+                                            ),
+                                        })
+                                        .await
+                                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                    self.append_event(
+                                        session_id,
+                                        branch_id,
+                                        EventKind::ApprovalRequested {
+                                            approval_id: ticket.approval_id,
+                                            call_id: call.call_id.clone(),
+                                            tool_name: call.tool_name.clone(),
+                                            arguments: call.input.clone(),
+                                            risk: RiskLevel::Medium,
+                                        },
+                                    )
+                                    .await?;
+                                    emitted += 1;
+                                }
+                                continue;
+                            }
+
+                            emitted += self
+                                .emit_phase(session_id, branch_id, LoopPhase::Execute)
+                                .await?;
+                            let report = self
+                                .tool_harness
+                                .execute(ToolExecutionRequest {
+                                    session_id: session_id.clone(),
+                                    workspace_root: manifest.workspace_root.clone(),
+                                    call: call.clone(),
+                                })
+                                .await
+                                .map_err(|error| anyhow::anyhow!(error.to_string()));
+                            match report {
+                                Ok(report) => {
+                                    emitted += self
+                                        .record_tool_report(
+                                            session_id, branch_id, manifest, &report,
+                                        )
+                                        .await?;
+                                    if let ToolOutcome::Success { output } = &report.outcome
+                                        && output.get("path").is_some()
+                                    {
+                                        _file_mutations_this_tick += 1;
+                                    }
+                                    self.apply_homeostasis_controllers(state, &report);
+                                    let new_mode = self.estimate_mode(state, 0);
+                                    if let Some(prev) = previous_mode
+                                        && prev != new_mode
+                                    {
+                                        self.append_event(
+                                            session_id,
+                                            branch_id,
+                                            EventKind::ModeChanged {
+                                                from: prev,
+                                                to: new_mode,
+                                                reason: format!(
+                                                    "post-tool homeostasis: tool={} exit={}",
+                                                    report.tool_name, report.exit_status
+                                                ),
+                                            },
+                                        )
+                                        .await?;
+                                        emitted += 1;
+                                    }
+                                    mode = new_mode;
+                                    previous_mode = Some(mode);
+                                    info!(
+                                        tool_name = %report.tool_name,
+                                        tool_run_id = %report.tool_run_id,
+                                        exit_status = report.exit_status,
+                                        mode = ?mode,
+                                        tool_calls = _tool_calls_this_tick,
+                                        file_mutations = _file_mutations_this_tick,
+                                        "tool execution completed"
+                                    );
+                                }
+                                Err(error) => {
+                                    state.error_streak += 1;
+                                    state.uncertainty = (state.uncertainty + 0.15).min(1.0);
+                                    state.budget.error_budget_remaining =
+                                        state.budget.error_budget_remaining.saturating_sub(1);
+                                    let new_mode = OperatingMode::Recover;
+                                    if let Some(prev) = previous_mode
+                                        && prev != new_mode
+                                    {
+                                        self.append_event(
+                                            session_id,
+                                            branch_id,
+                                            EventKind::ModeChanged {
+                                                from: prev,
+                                                to: new_mode,
+                                                reason: format!("tool execution error: {error}"),
+                                            },
+                                        )
+                                        .await?;
+                                        emitted += 1;
+                                    }
+                                    mode = new_mode;
+                                    previous_mode = Some(mode);
+                                    warn!(
+                                        error = %error,
+                                        error_streak = state.error_streak,
+                                        "tool execution failed"
+                                    );
+                                    self.append_event(
+                                        session_id,
+                                        branch_id,
+                                        EventKind::ToolCallFailed {
+                                            call_id: call.call_id.clone(),
+                                            tool_name: call.tool_name.clone(),
+                                            error: error.to_string(),
+                                        },
+                                    )
+                                    .await?;
+                                    emitted += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                emitted += self
+                    .emit_phase(session_id, branch_id, LoopPhase::Commit)
+                    .await?;
+
+                self.append_event(
+                    session_id,
+                    branch_id,
+                    EventKind::StepFinished {
+                        index: 0,
+                        stop_reason: model_stop_reason_string(&completion.stop_reason),
+                        directive_count,
+                    },
+                )
+                .await?;
+                emitted += 1;
+
+                self.append_event(
+                    session_id,
+                    branch_id,
+                    EventKind::RunFinished {
+                        reason: model_stop_reason_string(&completion.stop_reason),
+                        total_iterations: 1,
+                        final_answer: completion.final_answer,
+                        usage: completion.usage,
+                    },
+                )
+                .await?;
+                emitted += 1;
+            }
+            Err(error) => {
+                mode = OperatingMode::Recover;
+                state.error_streak += 1;
+                state.uncertainty = (state.uncertainty + 0.15).min(1.0);
+                state.budget.error_budget_remaining =
+                    state.budget.error_budget_remaining.saturating_sub(1);
+                self.append_event(
+                    session_id,
+                    branch_id,
+                    EventKind::RunErrored {
+                        error: error.to_string(),
+                    },
+                )
+                .await?;
+                emitted += 1;
+            }
+        }
+
+        if state.error_streak >= self.config.circuit_breaker_errors {
+            mode = OperatingMode::Recover;
+            warn!(
+                error_streak = state.error_streak,
+                threshold = self.config.circuit_breaker_errors,
+                "circuit breaker tripped"
+            );
+            self.append_event(
+                session_id,
+                branch_id,
+                EventKind::CircuitBreakerTripped {
+                    reason: "error streak exceeded threshold".to_owned(),
+                    error_streak: state.error_streak,
+                },
+            )
+            .await?;
+            emitted += 1;
+        }
+
+        emitted += self
+            .finalize_tick(session_id, branch_id, manifest, state, &mode)
+            .await?;
+        ctx.mode = mode;
+        info!(mode = ?mode, emitted, "tick finalized");
+        self.current_tick_output(session_id, branch_id, mode, (*state).clone(), emitted)
+            .await
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
+            session_id = %session_id,
+            branch = %branch_id.as_str(),
+            from_branch = ?from_branch.as_ref().map(|branch| branch.as_str())
+        )
+    )]
+    pub async fn create_branch(
+        &self,
+        session_id: &SessionId,
+        branch_id: BranchId,
+        from_branch: Option<BranchId>,
+        fork_sequence: Option<u64>,
+    ) -> Result<BranchInfo> {
+        let from_branch = from_branch.unwrap_or_else(BranchId::main);
+        let fork_sequence_value = {
+            let mut sessions = self.sessions.lock();
+            let session = sessions
+                .get_mut(session_id.as_str())
+                .with_context(|| format!("session not found: {session_id}"))?;
+            if session.branches.contains_key(&branch_id) {
+                bail!("branch already exists: {}", branch_id.as_str());
+            }
+            let parent = session
+                .branches
+                .get(&from_branch)
+                .with_context(|| format!("source branch not found: {}", from_branch.as_str()))?;
+            if let Some(target) = &parent.merged_into {
+                bail!(
+                    "source branch {} is merged into {} and is read-only",
+                    from_branch.as_str(),
+                    target.as_str()
+                );
+            }
+            let fork = fork_sequence.unwrap_or(parent.head_sequence);
+            if fork > parent.head_sequence {
+                bail!(
+                    "fork sequence {} exceeds source branch head {}",
+                    fork,
+                    parent.head_sequence
+                );
+            }
+
+            session.next_sequence_by_branch.insert(branch_id.clone(), 1);
+            session.branches.insert(
+                branch_id.clone(),
+                BranchRuntimeState {
+                    parent_branch: Some(from_branch.clone()),
+                    fork_sequence: fork,
+                    head_sequence: 0,
+                    merged_into: None,
+                },
+            );
+            fork
+        };
+
+        self.append_event(
+            session_id,
+            &branch_id,
+            EventKind::BranchCreated {
+                new_branch_id: branch_id.clone(),
+                fork_point_seq: fork_sequence_value,
+                name: branch_id.as_str().to_owned(),
+            },
+        )
+        .await?;
+        info!(
+            branch = %branch_id.as_str(),
+            from_branch = %from_branch.as_str(),
+            fork_sequence = fork_sequence_value,
+            "branch created"
+        );
+
+        self.branch_info(session_id, &branch_id)
+    }
+
+    pub async fn list_branches(&self, session_id: &SessionId) -> Result<Vec<BranchInfo>> {
+        let sessions = self.sessions.lock();
+        let session = sessions
+            .get(session_id.as_str())
+            .with_context(|| format!("session not found: {session_id}"))?;
+
+        let mut branches: Vec<_> = session
+            .branches
+            .iter()
+            .map(|(branch_id, state)| BranchInfo {
+                branch_id: branch_id.clone(),
+                parent_branch: state.parent_branch.clone(),
+                fork_sequence: state.fork_sequence,
+                head_sequence: state.head_sequence,
+                merged_into: state.merged_into.clone(),
+            })
+            .collect();
+        branches.sort_by(|a, b| a.branch_id.as_str().cmp(b.branch_id.as_str()));
+        Ok(branches)
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
+            session_id = %session_id,
+            source_branch = %source_branch.as_str(),
+            target_branch = %target_branch.as_str()
+        )
+    )]
+    pub async fn merge_branch(
+        &self,
+        session_id: &SessionId,
+        source_branch: BranchId,
+        target_branch: BranchId,
+    ) -> Result<BranchMergeResult> {
+        if source_branch == target_branch {
+            bail!("source and target branch must differ");
+        }
+        if source_branch == BranchId::main() {
+            bail!("main branch cannot be used as a merge source");
+        }
+
+        let source_head =
+            {
+                let sessions = self.sessions.lock();
+                let session = sessions
+                    .get(session_id.as_str())
+                    .with_context(|| format!("session not found: {session_id}"))?;
+                let source = session.branches.get(&source_branch).with_context(|| {
+                    format!("source branch not found: {}", source_branch.as_str())
+                })?;
+                if let Some(merged_into) = &source.merged_into {
+                    bail!(
+                        "source branch {} already merged into {}",
+                        source_branch.as_str(),
+                        merged_into.as_str()
+                    );
+                }
+                let target = session.branches.get(&target_branch).with_context(|| {
+                    format!("target branch not found: {}", target_branch.as_str())
+                })?;
+                if let Some(merged_into) = &target.merged_into {
+                    bail!(
+                        "target branch {} is merged into {} and is read-only",
+                        target_branch.as_str(),
+                        merged_into.as_str()
+                    );
+                }
+                source.head_sequence
+            };
+
+        self.append_event(
+            session_id,
+            &target_branch,
+            EventKind::BranchMerged {
+                source_branch_id: source_branch.clone(),
+                merge_seq: source_head,
+            },
+        )
+        .await?;
+
+        let target_head = self.peek_last_sequence(session_id, &target_branch)?;
+        {
+            let mut sessions = self.sessions.lock();
+            let session = sessions
+                .get_mut(session_id.as_str())
+                .with_context(|| format!("session not found: {session_id}"))?;
+            let source = session
+                .branches
+                .get_mut(&source_branch)
+                .with_context(|| format!("source branch not found: {}", source_branch.as_str()))?;
+            source.merged_into = Some(target_branch.clone());
+        }
+        info!(
+            source_head_sequence = source_head,
+            target_head_sequence = target_head,
+            "branch merged"
+        );
+
+        Ok(BranchMergeResult {
+            source_branch,
+            target_branch,
+            source_head_sequence: source_head,
+            target_head_sequence: target_head,
+        })
+    }
+
+    pub async fn resolve_approval(
+        &self,
+        session_id: &SessionId,
+        approval_id: uuid::Uuid,
+        approved: bool,
+        actor: impl Into<String>,
+    ) -> Result<()> {
+        let actor = actor.into();
+        let resolution = self
+            .approvals
+            .resolve(
+                ApprovalId::from_string(approval_id.to_string()),
+                approved,
+                actor.clone(),
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .with_context(|| format!("approval not pending: {approval_id}"))?;
+
+        let decision = if resolution.approved {
+            ApprovalDecision::Approved
+        } else {
+            ApprovalDecision::Denied
+        };
+
+        self.append_event(
+            session_id,
+            &BranchId::main(),
+            EventKind::ApprovalResolved {
+                approval_id: ApprovalId::from_string(approval_id.to_string()),
+                decision,
+                reason: Some(actor),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EventRecord> {
+        self.stream.subscribe()
+    }
+
+    /// Get a clone of the broadcast sender for injecting ephemeral events
+    /// (e.g., streaming text deltas from the provider).
+    pub fn event_sender(&self) -> broadcast::Sender<EventRecord> {
+        self.stream.clone()
+    }
+
+    pub async fn record_external_event(
+        &self,
+        session_id: &SessionId,
+        kind: EventKind,
+    ) -> Result<()> {
+        self.record_external_event_on_branch(session_id, &BranchId::main(), kind)
+            .await
+    }
+
+    #[instrument(
+        skip(self, kind),
+        fields(session_id = %session_id, branch = %branch_id.as_str())
+    )]
+    pub async fn record_external_event_on_branch(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        kind: EventKind,
+    ) -> Result<()> {
+        {
+            let sessions = self.sessions.lock();
+            if !sessions.contains_key(session_id.as_str()) {
+                bail!("session not found: {session_id}");
+            }
+        }
+        self.append_event(session_id, branch_id, kind).await
+    }
+
+    pub async fn read_events(
+        &self,
+        session_id: &SessionId,
+        from_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>> {
+        self.read_events_on_branch(session_id, &BranchId::main(), from_sequence, limit)
+            .await
+    }
+
+    pub async fn read_events_on_branch(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        from_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>> {
+        self.event_store
+            .read(session_id.clone(), branch_id.clone(), from_sequence, limit)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    }
+
+    /// Build conversation history from the session's event journal.
+    ///
+    /// Reads prior events and extracts user objectives (from `DeliberationProposed`)
+    /// and assistant responses (from `Message` with role=assistant, or aggregated
+    /// `TextDelta` events). Returns a list of `ConversationTurn` entries in
+    /// chronological order, capped at the most recent 50 turns to avoid
+    /// context overflow.
+    async fn build_conversation_history(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+    ) -> Vec<aios_protocol::ConversationTurn> {
+        let events = match self
+            .event_store
+            .read(session_id.clone(), branch_id.clone(), 0, 10_000)
+            .await
+        {
+            Ok(events) => events,
+            Err(err) => {
+                debug!(%err, "failed to read events for conversation history");
+                return Vec::new();
+            }
+        };
+
+        let mut turns = Vec::new();
+        let mut current_assistant_text = String::new();
+
+        for record in &events {
+            match &record.kind {
+                EventKind::DeliberationProposed { summary, .. } => {
+                    // Flush any pending assistant text before the next user turn.
+                    if !current_assistant_text.is_empty() {
+                        turns.push(aios_protocol::ConversationTurn {
+                            role: "assistant".to_owned(),
+                            content: std::mem::take(&mut current_assistant_text),
+                        });
+                    }
+                    if !summary.is_empty() {
+                        turns.push(aios_protocol::ConversationTurn {
+                            role: "user".to_owned(),
+                            content: summary.clone(),
+                        });
+                    }
+                }
+                EventKind::Message {
+                    role, content, ..
+                } if role == "assistant" => {
+                    current_assistant_text.push_str(content);
+                }
+                EventKind::TextDelta { delta, .. } => {
+                    current_assistant_text.push_str(delta);
+                }
+                EventKind::RunFinished { final_answer, .. } => {
+                    // If we have a final answer and no accumulated text, use it.
+                    if current_assistant_text.is_empty() {
+                        if let Some(answer) = final_answer {
+                            current_assistant_text = answer.clone();
+                        }
+                    }
+                    // Flush assistant text at run boundary.
+                    if !current_assistant_text.is_empty() {
+                        turns.push(aios_protocol::ConversationTurn {
+                            role: "assistant".to_owned(),
+                            content: std::mem::take(&mut current_assistant_text),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Flush any remaining assistant text.
+        if !current_assistant_text.is_empty() {
+            turns.push(aios_protocol::ConversationTurn {
+                role: "assistant".to_owned(),
+                content: current_assistant_text,
+            });
+        }
+
+        // Cap to most recent 50 turns to avoid context overflow.
+        let max_turns = 50;
+        if turns.len() > max_turns {
+            turns.drain(..turns.len() - max_turns);
+        }
+
+        turns
+    }
+
+    fn estimate_mode(&self, state: &AgentStateVector, pending_approvals: usize) -> OperatingMode {
+        if pending_approvals > 0 {
+            return OperatingMode::AskHuman;
+        }
+
+        if state.error_streak >= self.config.circuit_breaker_errors {
+            return OperatingMode::Recover;
+        }
+
+        if state.progress >= 0.98 {
+            return OperatingMode::Sleep;
+        }
+
+        if state.context_pressure > 0.8 || state.uncertainty > 0.65 {
+            return OperatingMode::Explore;
+        }
+
+        if state.side_effect_pressure > 0.6 {
+            return OperatingMode::Verify;
+        }
+
+        OperatingMode::Execute
+    }
+
+    fn apply_homeostasis_controllers(
+        &self,
+        state: &mut AgentStateVector,
+        report: &ToolExecutionReport,
+    ) {
+        state.budget.tool_calls_remaining = state.budget.tool_calls_remaining.saturating_sub(1);
+        state.budget.tokens_remaining = state.budget.tokens_remaining.saturating_sub(750);
+        state.budget.time_remaining_ms = state.budget.time_remaining_ms.saturating_sub(1200);
+
+        if report.exit_status == 0 {
+            state.progress = (state.progress + 0.12).min(1.0);
+            state.uncertainty = (state.uncertainty * 0.85).max(0.05);
+            state.error_streak = 0;
+            state.side_effect_pressure = (state.side_effect_pressure + 0.2).min(1.0);
+        } else {
+            state.error_streak += 1;
+            state.uncertainty = (state.uncertainty + 0.18).min(1.0);
+            state.budget.error_budget_remaining =
+                state.budget.error_budget_remaining.saturating_sub(1);
+            state.side_effect_pressure = (state.side_effect_pressure * 0.5).max(0.1);
+        }
+
+        state.context_pressure = (state.context_pressure + 0.03).min(1.0);
+        state.human_dependency = if state.error_streak >= 2 { 0.6 } else { 0.0 };
+
+        state.risk_level = if state.uncertainty > 0.75 || state.side_effect_pressure > 0.7 {
+            RiskLevel::High
+        } else if state.uncertainty > 0.45 || state.side_effect_pressure > 0.4 {
+            RiskLevel::Medium
+        } else {
+            RiskLevel::Low
+        };
+    }
+
+    async fn finalize_tick(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        manifest: &SessionManifest,
+        state: &mut AgentStateVector,
+        mode: &OperatingMode,
+    ) -> Result<u64> {
+        let mut emitted = 0_u64;
+
+        emitted += self
+            .emit_phase(session_id, branch_id, LoopPhase::Reflect)
+            .await?;
+
+        self.append_event(
+            session_id,
+            branch_id,
+            EventKind::BudgetUpdated {
+                budget: state.budget.clone(),
+                reason: "tick accounting".to_owned(),
+            },
+        )
+        .await?;
+        emitted += 1;
+
+        // Record budget metrics via Vigil GenAI metrics.
+        {
+            let metrics = life_vigil::metrics::GenAiMetrics::new("arcan");
+            metrics.record_budget(
+                state.budget.tokens_remaining,
+                state.budget.cost_remaining_usd,
+            );
+
+            // Detect and record mode transitions in the Reflect phase.
+            let previous_mode = {
+                let sessions = self.sessions.lock();
+                sessions
+                    .get(session_id.as_str())
+                    .map(|s| s.mode)
+                    .unwrap_or(OperatingMode::Explore)
+            };
+            if previous_mode != *mode {
+                let from_str = operating_mode_str(&previous_mode);
+                let to_str = operating_mode_str(mode);
+                metrics.record_mode_transition(from_str, to_str);
+                debug!(from = from_str, to = to_str, "operating mode transition");
+            }
+        }
+
+        self.append_event(
+            session_id,
+            branch_id,
+            EventKind::StateEstimated {
+                state: state.clone(),
+                mode: *mode,
+            },
+        )
+        .await?;
+        emitted += 1;
+
+        let checkpoint_id = if self.should_checkpoint(session_id)? {
+            let checkpoint = self
+                .create_checkpoint(session_id, branch_id, manifest, state)
+                .await?;
+            self.append_event(
+                session_id,
+                branch_id,
+                EventKind::CheckpointCreated {
+                    checkpoint_id: checkpoint.checkpoint_id.clone(),
+                    event_sequence: checkpoint.event_sequence,
+                    state_hash: checkpoint.state_hash.clone(),
+                },
+            )
+            .await?;
+            emitted += 1;
+            Some(checkpoint.checkpoint_id)
+        } else {
+            None
+        };
+
+        self.write_heartbeat(session_id, state, mode).await?;
+        self.append_event(
+            session_id,
+            branch_id,
+            EventKind::Heartbeat {
+                summary: "tick complete".to_owned(),
+                checkpoint_id,
+            },
+        )
+        .await?;
+        emitted += 1;
+
+        emitted += self
+            .emit_phase(session_id, branch_id, LoopPhase::Sleep)
+            .await?;
+
+        self.persist_runtime_state(session_id, state.clone(), *mode)?;
+
+        Ok(emitted)
+    }
+
+    async fn record_tool_report(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        manifest: &SessionManifest,
+        report: &ToolExecutionReport,
+    ) -> Result<u64> {
+        let mut emitted = 0;
+
+        self.append_event(
+            session_id,
+            branch_id,
+            EventKind::ToolCallStarted {
+                tool_run_id: report.tool_run_id.clone(),
+                tool_name: report.tool_name.clone(),
+            },
+        )
+        .await?;
+        emitted += 1;
+
+        let status = if report.exit_status == 0 {
+            SpanStatus::Ok
+        } else {
+            SpanStatus::Error
+        };
+        let result_value = serde_json::to_value(&report.outcome).unwrap_or_default();
+
+        self.append_event(
+            session_id,
+            branch_id,
+            EventKind::ToolCallCompleted {
+                tool_run_id: report.tool_run_id.clone(),
+                call_id: None,
+                tool_name: report.tool_name.clone(),
+                result: result_value,
+                duration_ms: 0,
+                status,
+            },
+        )
+        .await?;
+        emitted += 1;
+
+        if let ToolOutcome::Success { output } = &report.outcome
+            && let Some(path) = output.get("path").and_then(|v| v.as_str())
+        {
+            let full_path =
+                PathBuf::from(&manifest.workspace_root).join(path.trim_start_matches('/'));
+            let content_hash = if fs::try_exists(&full_path).await.unwrap_or(false) {
+                let data = fs::read(&full_path).await?;
+                sha256_bytes(&data)
+            } else {
+                "deleted".to_owned()
+            };
+
+            self.append_event(
+                session_id,
+                branch_id,
+                EventKind::FileMutated {
+                    path: path.to_owned(),
+                    content_hash,
+                },
+            )
+            .await?;
+            emitted += 1;
+        }
+
+        let run_dir = PathBuf::from(&manifest.workspace_root)
+            .join("tools")
+            .join("runs")
+            .join(report.tool_run_id.as_str());
+
+        fs::create_dir_all(&run_dir).await?;
+        self.write_pretty_json(run_dir.join("report.json"), report)
+            .await?;
+
+        let observation = extract_observation(&EventRecord::new(
+            session_id.clone(),
+            branch_id.clone(),
+            self.peek_last_sequence(session_id, branch_id)?,
+            EventKind::ToolCallCompleted {
+                tool_run_id: report.tool_run_id.clone(),
+                call_id: None,
+                tool_name: report.tool_name.clone(),
+                result: serde_json::to_value(&report.outcome).unwrap_or_default(),
+                duration_ms: 0,
+                status,
+            },
+        ));
+
+        if let Some(observation) = observation {
+            self.append_event(
+                session_id,
+                branch_id,
+                EventKind::Custom {
+                    event_type: "ObservationExtracted".to_owned(),
+                    data: serde_json::json!({
+                        "observation_id": observation.observation_id.to_string(),
+                    }),
+                },
+            )
+            .await?;
+            emitted += 1;
+        }
+
+        Ok(emitted)
+    }
+
+    async fn evaluate_tool_call_guards(
+        &self,
+        ctx: &TurnContext,
+        call: &ToolCall,
+    ) -> Result<Option<ToolCallGuardDecision>> {
+        let mut warning: Option<ToolCallGuardDecision> = None;
+
+        for guard in &ctx.tool_call_guards {
+            match guard.on_tool_call(ctx, call).await? {
+                ToolCallGuardDecision::Allow => {}
+                decision @ ToolCallGuardDecision::Warn { .. } => {
+                    warning = Some(decision);
+                }
+                decision @ ToolCallGuardDecision::Block { .. } => {
+                    return Ok(Some(decision));
+                }
+            }
+        }
+
+        Ok(warning)
+    }
+
+    async fn persist_loop_guard_event(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        call: &ToolCall,
+        decision: &ToolCallGuardDecision,
+    ) -> Result<u64> {
+        let (event_type, message, repetitions, signature) = match decision {
+            ToolCallGuardDecision::Warn {
+                message,
+                repetitions,
+                signature,
+            } => (
+                "loop_detection.warning",
+                message.as_str(),
+                *repetitions as u64,
+                signature.as_str(),
+            ),
+            ToolCallGuardDecision::Block {
+                message,
+                repetitions,
+                signature,
+            } => (
+                "loop_detection.hard_stop",
+                message.as_str(),
+                *repetitions as u64,
+                signature.as_str(),
+            ),
+            ToolCallGuardDecision::Allow => return Ok(0),
+        };
+
+        self.append_event(
+            session_id,
+            branch_id,
+            EventKind::Custom {
+                event_type: event_type.to_owned(),
+                data: serde_json::json!({
+                    "tool_name": call.tool_name,
+                    "call_id": call.call_id,
+                    "signature": signature,
+                    "message": message,
+                    "repetitions": repetitions,
+                }),
+            },
+        )
+        .await?;
+
+        Ok(1)
+    }
+
+    async fn emit_guard_message(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        decision: &ToolCallGuardDecision,
+        model: Option<String>,
+    ) -> Result<u64> {
+        let (role, content) = match decision {
+            ToolCallGuardDecision::Warn { message, .. } => ("system".to_owned(), message.clone()),
+            ToolCallGuardDecision::Block { message, .. } => {
+                ("assistant".to_owned(), message.clone())
+            }
+            ToolCallGuardDecision::Allow => return Ok(0),
+        };
+
+        self.append_event(
+            session_id,
+            branch_id,
+            EventKind::Message {
+                role,
+                content,
+                model,
+                token_usage: None,
+            },
+        )
+        .await?;
+
+        Ok(1)
+    }
+
+    async fn emit_phase(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        phase: LoopPhase,
+    ) -> Result<u64> {
+        let phase_span = life_vigil::spans::phase_span(phase);
+        async {
+            self.append_event(session_id, branch_id, EventKind::PhaseEntered { phase })
+                .await?;
+            Ok(1)
+        }
+        .instrument(phase_span)
+        .await
+    }
+
+    async fn append_event(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        kind: EventKind,
+    ) -> Result<()> {
+        let event_kind = event_kind_name(&kind);
+        let sequence = self.next_sequence(session_id, branch_id)?;
+        debug!(
+            session_id = %session_id,
+            branch = %branch_id.as_str(),
+            sequence,
+            event_kind,
+            "appending event"
+        );
+        let mut event = EventRecord::new(session_id.clone(), branch_id.clone(), sequence, kind);
+
+        // Dual-write: embed OTel trace/span IDs into the event for post-hoc correlation.
+        write_trace_context_on_record(&mut event);
+
+        let persisted = match self.event_store.append(event).await {
+            Ok(persisted) => persisted,
+            Err(append_error) => {
+                if let Err(resync_error) = self.resync_next_sequence(session_id, branch_id).await {
+                    warn!(
+                        session_id = %session_id,
+                        branch = %branch_id.as_str(),
+                        error = %append_error,
+                        resync_error = %resync_error,
+                        "event append failed and sequence resync failed"
+                    );
+                    return Err(anyhow::anyhow!(append_error.to_string())).context(format!(
+                        "failed appending event and failed sequence resync: {resync_error}"
+                    ));
+                }
+                warn!(
+                    session_id = %session_id,
+                    branch = %branch_id.as_str(),
+                    error = %append_error,
+                    "event append failed; sequence resynced"
+                );
+                return Err(anyhow::anyhow!(append_error.to_string()))
+                    .context("failed appending event; sequence was resynced");
+            }
+        };
+        let _ = self.stream.send(persisted.clone());
+        self.mark_branch_head(session_id, branch_id, persisted.sequence)?;
+        Ok(())
+    }
+
+    fn next_sequence(&self, session_id: &SessionId, branch_id: &BranchId) -> Result<u64> {
+        let mut sessions = self.sessions.lock();
+        let session = sessions
+            .get_mut(session_id.as_str())
+            .with_context(|| format!("session not found: {session_id}"))?;
+        if !session.branches.contains_key(branch_id) {
+            bail!("branch not found: {}", branch_id.as_str());
+        }
+        if let Some(merged_into) = session
+            .branches
+            .get(branch_id)
+            .and_then(|branch| branch.merged_into.as_ref())
+        {
+            bail!(
+                "branch {} is merged into {} and is read-only",
+                branch_id.as_str(),
+                merged_into.as_str()
+            );
+        }
+        let sequence = *session
+            .next_sequence_by_branch
+            .entry(branch_id.clone())
+            .or_insert(1);
+        session
+            .next_sequence_by_branch
+            .insert(branch_id.clone(), sequence.saturating_add(1));
+        Ok(sequence)
+    }
+
+    fn peek_last_sequence(&self, session_id: &SessionId, branch_id: &BranchId) -> Result<u64> {
+        let sessions = self.sessions.lock();
+        let session = sessions
+            .get(session_id.as_str())
+            .with_context(|| format!("session not found: {session_id}"))?;
+        if !session.branches.contains_key(branch_id) {
+            bail!("branch not found: {}", branch_id.as_str());
+        }
+        Ok(session
+            .next_sequence_by_branch
+            .get(branch_id)
+            .copied()
+            .unwrap_or(1)
+            .saturating_sub(1))
+    }
+
+    async fn resync_next_sequence(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+    ) -> Result<()> {
+        let latest = self
+            .event_store
+            .head(session_id.clone(), branch_id.clone())
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+            .context("failed loading latest sequence for resync")?;
+        let mut sessions = self.sessions.lock();
+        let session = sessions
+            .get_mut(session_id.as_str())
+            .with_context(|| format!("session not found: {session_id}"))?;
+        if !session.branches.contains_key(branch_id) {
+            bail!("branch not found: {}", branch_id.as_str());
+        }
+        session
+            .next_sequence_by_branch
+            .insert(branch_id.clone(), latest.saturating_add(1));
+        Ok(())
+    }
+
+    fn mark_branch_head(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        sequence: u64,
+    ) -> Result<()> {
+        let mut sessions = self.sessions.lock();
+        let session = sessions
+            .get_mut(session_id.as_str())
+            .with_context(|| format!("session not found: {session_id}"))?;
+        let branch = session
+            .branches
+            .get_mut(branch_id)
+            .with_context(|| format!("branch not found: {}", branch_id.as_str()))?;
+        branch.head_sequence = branch.head_sequence.max(sequence);
+        Ok(())
+    }
+
+    fn branch_info(&self, session_id: &SessionId, branch_id: &BranchId) -> Result<BranchInfo> {
+        let sessions = self.sessions.lock();
+        let session = sessions
+            .get(session_id.as_str())
+            .with_context(|| format!("session not found: {session_id}"))?;
+        let state = session
+            .branches
+            .get(branch_id)
+            .with_context(|| format!("branch not found: {}", branch_id.as_str()))?;
+        Ok(BranchInfo {
+            branch_id: branch_id.clone(),
+            parent_branch: state.parent_branch.clone(),
+            fork_sequence: state.fork_sequence,
+            head_sequence: state.head_sequence,
+            merged_into: state.merged_into.clone(),
+        })
+    }
+
+    fn should_checkpoint(&self, session_id: &SessionId) -> Result<bool> {
+        let mut sessions = self.sessions.lock();
+        let session = sessions
+            .get_mut(session_id.as_str())
+            .with_context(|| format!("session not found: {session_id}"))?;
+        session.tick_count += 1;
+        Ok(session.tick_count % self.config.checkpoint_every_ticks == 0)
+    }
+
+    async fn create_checkpoint(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        manifest: &SessionManifest,
+        state: &AgentStateVector,
+    ) -> Result<CheckpointManifest> {
+        let checkpoint_id = CheckpointId::default();
+        let state_hash = sha256_json(state)?;
+        let checkpoint = CheckpointManifest {
+            checkpoint_id: checkpoint_id.clone(),
+            session_id: session_id.clone(),
+            branch_id: branch_id.clone(),
+            created_at: Utc::now(),
+            event_sequence: self.peek_last_sequence(session_id, branch_id)?,
+            state_hash,
+            note: "automatic heartbeat checkpoint".to_owned(),
+        };
+
+        let checkpoint_dir = PathBuf::from(&manifest.workspace_root)
+            .join("checkpoints")
+            .join(checkpoint_id.as_str());
+        fs::create_dir_all(&checkpoint_dir).await?;
+        self.write_pretty_json(checkpoint_dir.join("manifest.json"), &checkpoint)
+            .await?;
+        Ok(checkpoint)
+    }
+
+    async fn write_heartbeat(
+        &self,
+        session_id: &SessionId,
+        state: &AgentStateVector,
+        mode: &OperatingMode,
+    ) -> Result<()> {
+        let workspace_root = {
+            let sessions = self.sessions.lock();
+            let session = sessions
+                .get(session_id.as_str())
+                .with_context(|| format!("session not found: {session_id}"))?;
+            session.manifest.workspace_root.clone()
+        };
+
+        let payload = serde_json::json!({
+            "at": Utc::now(),
+            "mode": mode,
+            "state": state,
+        });
+        self.write_pretty_json(
+            PathBuf::from(workspace_root).join("state/heartbeat.json"),
+            &payload,
+        )
+        .await
+    }
+
+    fn persist_runtime_state(
+        &self,
+        session_id: &SessionId,
+        state: AgentStateVector,
+        mode: OperatingMode,
+    ) -> Result<()> {
+        let mut sessions = self.sessions.lock();
+        let session = sessions
+            .get_mut(session_id.as_str())
+            .with_context(|| format!("session not found: {session_id}"))?;
+        session.state_vector = state.clone();
+        session.mode = mode;
+
+        // Sync lakebase at the workspace root
+        if let Some(parent) = self.config.root.parent() {
+            let lake_dir = parent.join(".lake");
+            let state_json = serde_json::to_string_pretty(&state).unwrap_or_default();
+            let mode_str = match mode {
+                OperatingMode::Explore => "explore",
+                OperatingMode::Execute => "execute",
+                OperatingMode::Verify => "verify",
+                OperatingMode::AskHuman => "ask_human",
+                OperatingMode::Recover => "recover",
+                OperatingMode::Sleep => "sleep",
+            };
+
+            // Fire and forget IO, but in an async context we need to spawn it or do it blocking
+            // Since this is a synchronous function, we can't await. Let's spawn it.
+            let lake_dir_clone = lake_dir.clone();
+            tokio::spawn(async move {
+                let _ = fs::create_dir_all(&lake_dir_clone).await;
+                let _ = fs::write(lake_dir_clone.join("state.json"), state_json).await;
+                let _ = fs::write(lake_dir_clone.join("mode.txt"), mode_str).await;
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn current_tick_output(
+        &self,
+        session_id: &SessionId,
+        branch_id: &BranchId,
+        mode: OperatingMode,
+        state: AgentStateVector,
+        events_emitted: u64,
+    ) -> Result<TickOutput> {
+        Ok(TickOutput {
+            session_id: session_id.clone(),
+            mode,
+            state,
+            events_emitted,
+            last_sequence: self.peek_last_sequence(session_id, branch_id)?,
+        })
+    }
+
+    async fn initialize_workspace(&self, root: &Path) -> Result<()> {
+        let directories = [
+            "events",
+            "checkpoints",
+            "state",
+            "tools/runs",
+            "artifacts/build",
+            "artifacts/reports",
+            "memory",
+            "inbox/human_requests",
+            "outbox/ui_stream",
+        ];
+
+        for directory in directories {
+            fs::create_dir_all(root.join(directory)).await?;
+        }
+
+        let thread_path = root.join("state/thread.md");
+        if !fs::try_exists(&thread_path).await.unwrap_or(false) {
+            fs::write(&thread_path, "# Session Thread\n\n- Session created\n").await?;
+        }
+
+        let plan_path = root.join("state/plan.yaml");
+        if !fs::try_exists(&plan_path).await.unwrap_or(false) {
+            fs::write(
+                &plan_path,
+                "version: 1\nmode: explore\nsteps:\n  - id: bootstrap\n    status: pending\n",
+            )
+            .await?;
+        }
+
+        let task_graph_path = root.join("state/task_graph.json");
+        if !fs::try_exists(&task_graph_path).await.unwrap_or(false) {
+            fs::write(
+                &task_graph_path,
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "nodes": [{"id": "bootstrap", "type": "task"}],
+                    "edges": [],
+                }))?,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    fn session_root(&self, session_id: &SessionId) -> PathBuf {
+        self.config.root.join("sessions").join(session_id.as_str())
+    }
+
+    async fn write_pretty_json<T: Serialize>(&self, path: PathBuf, value: &T) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let payload = serde_json::to_string_pretty(value)?;
+        fs::write(path, payload).await?;
+        Ok(())
+    }
+}
+
+fn sha256_json<T: Serialize>(value: &T) -> Result<String> {
+    let payload = serde_json::to_vec(value)?;
+    Ok(sha256_bytes(&payload))
+}
+
+/// Write the current OTel trace context (trace_id, span_id) into an EventRecord.
+///
+/// Enables dual-write: persisted events carry OTel correlation IDs so they
+/// can be linked back to their distributed traces for post-hoc analysis.
+fn write_trace_context_on_record(event: &mut EventRecord) {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let current_span = tracing::Span::current();
+    let otel_context = current_span.context();
+    let span_ref = otel_context.span();
+    let span_context = span_ref.span_context();
+
+    if span_context.is_valid() {
+        event.trace_id = Some(span_context.trace_id().to_string());
+        event.span_id = Some(span_context.span_id().to_string());
+    }
+}
+
+fn operating_mode_str(mode: &OperatingMode) -> &'static str {
+    match mode {
+        OperatingMode::Explore => "explore",
+        OperatingMode::Execute => "execute",
+        OperatingMode::Verify => "verify",
+        OperatingMode::AskHuman => "ask_human",
+        OperatingMode::Recover => "recover",
+        OperatingMode::Sleep => "sleep",
+    }
+}
+
+fn model_stop_reason_string(stop_reason: &aios_protocol::ModelStopReason) -> String {
+    match stop_reason {
+        aios_protocol::ModelStopReason::Completed => "completed".to_owned(),
+        aios_protocol::ModelStopReason::ToolCall => "tool_call".to_owned(),
+        aios_protocol::ModelStopReason::MaxIterations => "max_iterations".to_owned(),
+        aios_protocol::ModelStopReason::Cancelled => "cancelled".to_owned(),
+        aios_protocol::ModelStopReason::Error => "error".to_owned(),
+        aios_protocol::ModelStopReason::Other(reason) => reason.clone(),
+    }
+}
+
+fn extract_observation(event: &EventRecord) -> Option<aios_protocol::Observation> {
+    let text = match &event.kind {
+        EventKind::ToolCallCompleted {
+            tool_name,
+            result,
+            status,
+            ..
+        } => format!("tool call completed ({tool_name}): {result} [status={status:?}]"),
+        EventKind::ErrorRaised { message } => format!("error observed: {message}"),
+        EventKind::CheckpointCreated { checkpoint_id, .. } => {
+            format!("checkpoint created: {checkpoint_id}")
+        }
+        _ => return None,
+    };
+
+    Some(aios_protocol::Observation {
+        observation_id: uuid::Uuid::new_v4(),
+        created_at: event.timestamp,
+        text,
+        tags: vec!["auto".to_owned()],
+        provenance: aios_protocol::Provenance {
+            event_start: event.sequence,
+            event_end: event.sequence,
+            files: vec![FileProvenance {
+                path: format!(
+                    "events/{}.jsonl#branch={}",
+                    event.session_id.as_str(),
+                    event.branch_id.as_str()
+                ),
+                sha256: "pending".to_owned(),
+            }],
+        },
+    })
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex::encode(digest)
+}
+
+fn hash_tool_call_signature(call: &ToolCall) -> String {
+    let payload = serde_json::json!({
+        "tool_name": call.tool_name,
+        "input": normalize_json_value(&call.input),
+    });
+    let serialized = serde_json::to_vec(&payload).unwrap_or_default();
+    let mut hasher = Hasher::new();
+    hasher.update(&serialized);
+    hasher.finalize().to_hex().to_string()
+}
+
+fn normalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let normalized = keys
+                .into_iter()
+                .map(|key| {
+                    let normalized_value = map
+                        .get(&key)
+                        .map(normalize_json_value)
+                        .unwrap_or(Value::Null);
+                    (key, normalized_value)
+                })
+                .collect::<Map<String, Value>>();
+            Value::Object(normalized)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(normalize_json_value).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn event_kind_name(kind: &EventKind) -> &'static str {
+    match kind {
+        EventKind::SessionCreated { .. } => "session_created",
+        EventKind::BranchCreated { .. } => "branch_created",
+        EventKind::BranchMerged { .. } => "branch_merged",
+        EventKind::PhaseEntered { .. } => "phase_entered",
+        EventKind::DeliberationProposed { .. } => "deliberation_proposed",
+        EventKind::ApprovalRequested { .. } => "approval_requested",
+        EventKind::ApprovalResolved { .. } => "approval_resolved",
+        EventKind::ToolCallRequested { .. } => "tool_call_requested",
+        EventKind::ToolCallStarted { .. } => "tool_call_started",
+        EventKind::ToolCallCompleted { .. } => "tool_call_completed",
+        EventKind::VoiceSessionStarted { .. } => "voice_session_started",
+        EventKind::VoiceInputChunk { .. } => "voice_input_chunk",
+        EventKind::VoiceOutputChunk { .. } => "voice_output_chunk",
+        EventKind::VoiceSessionStopped { .. } => "voice_session_stopped",
+        EventKind::VoiceAdapterError { .. } => "voice_adapter_error",
+        EventKind::FileMutated { .. } => "file_mutated",
+        EventKind::Heartbeat { .. } => "heartbeat",
+        EventKind::CheckpointCreated { .. } => "checkpoint_created",
+        EventKind::StateEstimated { .. } => "state_estimated",
+        EventKind::BudgetUpdated { .. } => "budget_updated",
+        EventKind::CircuitBreakerTripped { .. } => "circuit_breaker_tripped",
+        EventKind::ErrorRaised { .. } => "error_raised",
+        _ => "custom",
+    }
+}
+
+#[allow(dead_code)]
+fn _budget_sanity(budget: &BudgetState) -> Result<()> {
+    if budget.cost_remaining_usd < 0.0 {
+        bail!("budget cannot be negative");
+    }
+    Ok(())
+}

@@ -1,0 +1,20 @@
+[package]
+name = "aios-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Execution sandboxing for Agent OS tool invocation"
+
+[dependencies]
+aios-protocol = { path = "../aios-protocol", version = "0.2.0" }
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

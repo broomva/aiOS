@@ -1,0 +1,29 @@
+[package]
+name = "aios-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Canonical Agent OS runtime engine"
+
+[dependencies]
+aios-protocol = { path = "../aios-protocol", version = "0.2.0" }
+anyhow.workspace = true
+async-trait.workspace = true
+blake3 = "1.8"
+chrono.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-opentelemetry = "0.30"
+opentelemetry = "0.29"
+uuid.workspace = true
+life-vigil.workspace = true
+
+[lints]
+workspace = true

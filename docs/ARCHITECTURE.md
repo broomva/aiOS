@@ -1,0 +1,150 @@
+# aiOS Kernel Architecture (Rust)
+
+This repository implements a microkernel-style agent operating system where **sessions** are the unit of execution and **side effects** are governed by policy, sandboxing, and durable events.
+
+## Dependency Chain (Bottom -> Top)
+
+1. `aios-model`
+- Canonical data model and event schema.
+- Defines: session manifest, capabilities, tool calls, event kinds, memory records, checkpoints, homeostasis state vector.
+- No runtime side effects.
+
+2. `aios-events`
+- Append-only event log + subscription stream.
+- Defines: `EventStore`, `FileEventStore`, `EventJournal`, stream hub.
+- Depends on: `aios-model`.
+
+3. `aios-policy`
+- Capability evaluation, approval queue, session-scoped policy overrides.
+- Defines: `PolicyEngine`, `SessionPolicyEngine`, `ApprovalQueue`.
+- Depends on: `aios-model`.
+
+4. `aios-sandbox`
+- Constrained tool execution substrate.
+- Defines: `SandboxRunner`, `LocalSandboxRunner`, limits and execution result.
+- Depends on: `aios-model`.
+
+5. `aios-tools`
+- Tool registry + dispatcher.
+- Built-in tool kinds: `fs.read`, `fs.write`, `shell.exec`.
+- Dispatch flow: lookup -> policy check -> approval/deny -> execute via sandbox.
+- Depends on: `aios-model`, `aios-policy`, `aios-sandbox`.
+
+6. `aios-memory`
+- Durable soul + observation store with provenance.
+- Defines: `MemoryStore`, `WorkspaceMemoryStore`, `extract_observation`.
+- Depends on: `aios-model`.
+
+7. `aios-runtime`
+- Kernel loop and control plane.
+- Services: session manager, workspace bootstrap, ordered turn middleware chain, middleware-installed tool-call guards, event emission, tool execution orchestration, checkpoint/heartbeat, homeostasis loop.
+- Depends on: `aios-model`, `aios-events`, `aios-tools`, `aios-memory`, `aios-policy`.
+
+8. `aios-kernel`
+- Composition root/builder for all services.
+- Exposes a clean API: create session, tick loop, resolve approvals, subscribe events.
+- Depends on: all runtime-facing crates.
+
+9. `apps/aiosd`
+- Demo daemon binary.
+- Runs a bootstrap scenario and prints event stream.
+
+## Session Workspace Layout
+
+Each session is rooted at:
+
+`<root>/sessions/<session-id>/`
+
+Key files and directories:
+- `manifest.json`
+- `state/thread.md`
+- `state/plan.yaml`
+- `state/task_graph.json`
+- `state/heartbeat.json`
+- `checkpoints/<checkpoint-id>/manifest.json`
+- `tools/runs/<tool-run-id>/report.json`
+- `memory/soul.json`
+- `memory/observations.jsonl`
+- `artifacts/**`
+- `inbox/human_requests/`
+- `outbox/ui_stream/`
+
+## Kernel Tick Lifecycle
+
+Each tick executes:
+1. `build turn context` (input, manifest, state snapshot, pending approvals, estimated mode)
+2. `turn middleware chain` (ordered `TurnMiddleware::process(ctx, next)` composition)
+3. `sense` (phase events + budget instrumentation)
+4. `estimate` (state vector + operating mode event)
+5. `tool-call guards` (middleware-installed checks against provider-emitted tool calls before gate/execute)
+6. `gate` (policy/approval)
+7. `execute` (tool dispatch in sandbox)
+8. `commit` (tool reports + file mutation events)
+9. `reflect` (observation extraction + memory write)
+10. `heartbeat` (budget update + checkpoint + state snapshot)
+11. `sleep` (await next external signal)
+
+## Homeostasis Model
+
+State vector (`AgentStateVector`):
+- `progress`
+- `uncertainty`
+- `risk_level`
+- `budget` (`tokens/time/cost/tool calls/error budget`)
+- `error_streak`
+- `context_pressure`
+- `side_effect_pressure`
+- `human_dependency`
+
+Controllers:
+- **Uncertainty controller**: high uncertainty pushes mode toward `Explore`.
+- **Error controller**: streak >= threshold trips `Recover` circuit breaker.
+- **Budget controller**: every tool call decrements budgets.
+- **Context controller**: pressure raises exploration/compression preference.
+- **Side-effect controller**: high mutation pressure routes through `Verify`.
+
+Modes:
+- `Explore`
+- `Execute`
+- `Verify`
+- `Recover`
+- `AskHuman`
+- `Sleep`
+
+## Event-Native Streaming
+
+All important state transitions become `EventKind` records. This supports:
+- real-time UI streaming
+- replay from cursor
+- auditability and postmortems
+- deterministic-enough recovery
+
+Interface adapters convert kernel-native events into client-native protocols without changing
+runtime semantics. Current adapters:
+- Native SSE (`/events/stream`) for raw `EventRecord`.
+- Vercel AI SDK v6 UIMessage stream (`/events/stream/vercel-ai-sdk-v6`) with
+  `x-vercel-ai-ui-message-stream: v1` and typed custom `data-aios-event` parts.
+- OpenAPI/Docs adapter: `/openapi.json` + Scalar UI at `/docs`.
+
+The event model now also includes first-slice voice events:
+- `voice_session_started`
+- `voice_input_chunk`
+- `voice_output_chunk`
+- `voice_session_stopped`
+- `voice_adapter_error`
+
+## Branch Lifecycle Semantics
+
+- Every branch has an independent monotonic event sequence.
+- `create_branch` validates that `fork_sequence` does not exceed the source branch head.
+- `merge_branch` only allows non-`main` source branches and emits a merge event on the target branch.
+- Once a branch is merged, it is marked read-only (`merged_into`) and cannot emit new events.
+
+## Observability Boundaries
+
+`tracing` spans are expected at:
+- kernel API entry points
+- runtime session/tick/branch operations
+- tool dispatch and execution handlers
+- sandbox command execution
+- event-store append/read/sequence paths
