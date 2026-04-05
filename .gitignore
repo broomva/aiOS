@@ -1,0 +1,6 @@
+/target
+/.aios
+/.aios-*/
+.venv/
+.DS_Store
+.entire/
