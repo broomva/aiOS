@@ -1,0 +1,18 @@
+[package]
+name = "life-aios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Kernel contract facade for the Life Agent OS — re-exports aios-protocol, aios-events, aios-runtime, and aios-kernel"
+
+[dependencies]
+aios-protocol = { path = "../aios-protocol", version = "0.3.0" }
+aios-events = { path = "../aios-events", version = "0.3.0" }
+aios-runtime = { path = "../aios-runtime", version = "0.3.0" }
+aios-kernel = { path = "../aios-kernel", version = "0.3.0" }
+
+[lints]
+workspace = true
