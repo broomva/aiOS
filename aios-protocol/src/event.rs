@@ -615,6 +615,89 @@ pub enum EventKind {
     },
 }
 
+impl EventKind {
+    /// Returns the PascalCase variant name as a static string.
+    ///
+    /// Useful for telemetry span attributes, log fields, and journal indexing
+    /// without the overhead of serialization.
+    #[allow(clippy::too_many_lines)]
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::UserMessage { .. } => "UserMessage",
+            Self::ExternalSignal { .. } => "ExternalSignal",
+            Self::SessionCreated { .. } => "SessionCreated",
+            Self::SessionResumed { .. } => "SessionResumed",
+            Self::SessionClosed { .. } => "SessionClosed",
+            Self::BranchCreated { .. } => "BranchCreated",
+            Self::BranchMerged { .. } => "BranchMerged",
+            Self::PhaseEntered { .. } => "PhaseEntered",
+            Self::DeliberationProposed { .. } => "DeliberationProposed",
+            Self::RunStarted { .. } => "RunStarted",
+            Self::RunFinished { .. } => "RunFinished",
+            Self::RunErrored { .. } => "RunErrored",
+            Self::StepStarted { .. } => "StepStarted",
+            Self::StepFinished { .. } => "StepFinished",
+            Self::AssistantTextDelta { .. } => "AssistantTextDelta",
+            Self::AssistantMessageCommitted { .. } => "AssistantMessageCommitted",
+            Self::TextDelta { .. } => "TextDelta",
+            Self::Message { .. } => "Message",
+            Self::ToolCallRequested { .. } => "ToolCallRequested",
+            Self::ToolCallStarted { .. } => "ToolCallStarted",
+            Self::ToolCallCompleted { .. } => "ToolCallCompleted",
+            Self::ToolCallFailed { .. } => "ToolCallFailed",
+            Self::FileWrite { .. } => "FileWrite",
+            Self::FileDelete { .. } => "FileDelete",
+            Self::FileRename { .. } => "FileRename",
+            Self::FileMutated { .. } => "FileMutated",
+            Self::StatePatchCommitted { .. } => "StatePatchCommitted",
+            Self::StatePatched { .. } => "StatePatched",
+            Self::ContextCompacted { .. } => "ContextCompacted",
+            Self::PolicyEvaluated { .. } => "PolicyEvaluated",
+            Self::ApprovalRequested { .. } => "ApprovalRequested",
+            Self::ApprovalResolved { .. } => "ApprovalResolved",
+            Self::SnapshotCreated { .. } => "SnapshotCreated",
+            Self::SandboxCreated { .. } => "SandboxCreated",
+            Self::SandboxExecuted { .. } => "SandboxExecuted",
+            Self::SandboxViolation { .. } => "SandboxViolation",
+            Self::SandboxDestroyed { .. } => "SandboxDestroyed",
+            Self::ObservationAppended { .. } => "ObservationAppended",
+            Self::ReflectionCompacted { .. } => "ReflectionCompacted",
+            Self::MemoryProposed { .. } => "MemoryProposed",
+            Self::MemoryCommitted { .. } => "MemoryCommitted",
+            Self::MemoryTombstoned { .. } => "MemoryTombstoned",
+            Self::Heartbeat { .. } => "Heartbeat",
+            Self::StateEstimated { .. } => "StateEstimated",
+            Self::BudgetUpdated { .. } => "BudgetUpdated",
+            Self::ModeChanged { .. } => "ModeChanged",
+            Self::GatesUpdated { .. } => "GatesUpdated",
+            Self::CircuitBreakerTripped { .. } => "CircuitBreakerTripped",
+            Self::CheckpointCreated { .. } => "CheckpointCreated",
+            Self::CheckpointRestored { .. } => "CheckpointRestored",
+            Self::VoiceSessionStarted { .. } => "VoiceSessionStarted",
+            Self::VoiceInputChunk { .. } => "VoiceInputChunk",
+            Self::VoiceOutputChunk { .. } => "VoiceOutputChunk",
+            Self::VoiceSessionStopped { .. } => "VoiceSessionStopped",
+            Self::VoiceAdapterError { .. } => "VoiceAdapterError",
+            Self::WorldModelObserved { .. } => "WorldModelObserved",
+            Self::WorldModelRollout { .. } => "WorldModelRollout",
+            Self::IntentProposed { .. } => "IntentProposed",
+            Self::IntentEvaluated { .. } => "IntentEvaluated",
+            Self::IntentApproved { .. } => "IntentApproved",
+            Self::IntentRejected { .. } => "IntentRejected",
+            Self::HiveTaskCreated { .. } => "HiveTaskCreated",
+            Self::HiveArtifactShared { .. } => "HiveArtifactShared",
+            Self::HiveSelectionMade { .. } => "HiveSelectionMade",
+            Self::HiveGenerationCompleted { .. } => "HiveGenerationCompleted",
+            Self::HiveTaskCompleted { .. } => "HiveTaskCompleted",
+            Self::Queued { .. } => "Queued",
+            Self::Steered { .. } => "Steered",
+            Self::QueueDrained { .. } => "QueueDrained",
+            Self::ErrorRaised { .. } => "ErrorRaised",
+            Self::Custom { .. } => "Custom",
+        }
+    }
+}
+
 // ─── Supporting types ──────────────────────────────────────────────
 
 /// Agent loop phase (from aiOS).
@@ -1827,6 +1910,66 @@ mod tests {
             back.kind,
             EventKind::HiveTaskCreated { agent_count: 5, .. }
         ));
+    }
+
+    #[test]
+    fn event_kind_variant_name() {
+        assert_eq!(
+            EventKind::PhaseEntered {
+                phase: LoopPhase::Perceive
+            }
+            .variant_name(),
+            "PhaseEntered"
+        );
+        assert_eq!(
+            EventKind::TextDelta {
+                delta: "x".into(),
+                index: None
+            }
+            .variant_name(),
+            "TextDelta"
+        );
+        assert_eq!(
+            EventKind::RunFinished {
+                reason: "done".into(),
+                total_iterations: 1,
+                final_answer: None,
+                usage: None,
+            }
+            .variant_name(),
+            "RunFinished"
+        );
+        assert_eq!(
+            EventKind::UserMessage {
+                content: "hi".into()
+            }
+            .variant_name(),
+            "UserMessage"
+        );
+        assert_eq!(
+            EventKind::ErrorRaised {
+                message: "boom".into()
+            }
+            .variant_name(),
+            "ErrorRaised"
+        );
+        assert_eq!(
+            EventKind::Custom {
+                event_type: "Foo".into(),
+                data: serde_json::json!(null),
+            }
+            .variant_name(),
+            "Custom"
+        );
+        assert_eq!(
+            EventKind::HiveTaskCreated {
+                hive_task_id: HiveTaskId::from_string("H1"),
+                objective: "test".into(),
+                agent_count: 1,
+            }
+            .variant_name(),
+            "HiveTaskCreated"
+        );
     }
 
     #[test]
