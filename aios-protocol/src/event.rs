@@ -329,6 +329,41 @@ pub enum EventKind {
         error: String,
     },
 
+    // ── Knowledge operations ──
+    /// Agent searched the knowledge graph.
+    KnowledgeSearched {
+        /// The search query.
+        query: String,
+        /// Number of results returned.
+        result_count: u32,
+        /// Highest relevance score among results.
+        top_relevance: f64,
+        /// Search duration in milliseconds.
+        duration_ms: u64,
+    },
+    /// Knowledge context was injected into the agent prompt.
+    KnowledgeRetrieved {
+        /// Number of notes injected into context.
+        note_count: u32,
+        /// Estimated token count of injected context.
+        context_tokens: u32,
+        /// Source of the injected knowledge.
+        source: String,
+    },
+    /// Knowledge quality was evaluated.
+    KnowledgeEvaluated {
+        /// Aggregate health score (0.0-1.0).
+        health_score: f32,
+        /// Total notes in the knowledge index.
+        note_count: u32,
+        /// Number of detected contradictions.
+        contradictions: u32,
+        /// Number of referenced but missing pages.
+        missing_pages: u32,
+        /// Number of orphan pages.
+        orphans: u32,
+    },
+
     // ── File operations (from Lago) ──
     FileWrite {
         path: String,
@@ -645,6 +680,9 @@ impl EventKind {
             Self::ToolCallStarted { .. } => "ToolCallStarted",
             Self::ToolCallCompleted { .. } => "ToolCallCompleted",
             Self::ToolCallFailed { .. } => "ToolCallFailed",
+            Self::KnowledgeSearched { .. } => "KnowledgeSearched",
+            Self::KnowledgeRetrieved { .. } => "KnowledgeRetrieved",
+            Self::KnowledgeEvaluated { .. } => "KnowledgeEvaluated",
             Self::FileWrite { .. } => "FileWrite",
             Self::FileDelete { .. } => "FileDelete",
             Self::FileRename { .. } => "FileRename",
@@ -901,6 +939,24 @@ enum EventKindKnown {
         call_id: String,
         tool_name: String,
         error: String,
+    },
+    KnowledgeSearched {
+        query: String,
+        result_count: u32,
+        top_relevance: f64,
+        duration_ms: u64,
+    },
+    KnowledgeRetrieved {
+        note_count: u32,
+        context_tokens: u32,
+        source: String,
+    },
+    KnowledgeEvaluated {
+        health_score: f32,
+        note_count: u32,
+        contradictions: u32,
+        missing_pages: u32,
+        orphans: u32,
     },
     FileWrite {
         path: String,
@@ -1318,6 +1374,39 @@ impl From<EventKindKnown> for EventKind {
                 call_id,
                 tool_name,
                 error,
+            },
+            EventKindKnown::KnowledgeSearched {
+                query,
+                result_count,
+                top_relevance,
+                duration_ms,
+            } => Self::KnowledgeSearched {
+                query,
+                result_count,
+                top_relevance,
+                duration_ms,
+            },
+            EventKindKnown::KnowledgeRetrieved {
+                note_count,
+                context_tokens,
+                source,
+            } => Self::KnowledgeRetrieved {
+                note_count,
+                context_tokens,
+                source,
+            },
+            EventKindKnown::KnowledgeEvaluated {
+                health_score,
+                note_count,
+                contradictions,
+                missing_pages,
+                orphans,
+            } => Self::KnowledgeEvaluated {
+                health_score,
+                note_count,
+                contradictions,
+                missing_pages,
+                orphans,
             },
             EventKindKnown::FileWrite {
                 path,
@@ -1786,6 +1875,62 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_events_roundtrip() {
+        let searched = EventKind::KnowledgeSearched {
+            query: "temporal validity".into(),
+            result_count: 3,
+            top_relevance: 0.82,
+            duration_ms: 47,
+        };
+        let searched_json = serde_json::to_string(&searched).unwrap();
+        let searched_back: EventKind = serde_json::from_str(&searched_json).unwrap();
+        assert!(matches!(
+            searched_back,
+            EventKind::KnowledgeSearched {
+                result_count: 3,
+                duration_ms: 47,
+                ..
+            }
+        ));
+
+        let retrieved = EventKind::KnowledgeRetrieved {
+            note_count: 8,
+            context_tokens: 600,
+            source: "wake_up".into(),
+        };
+        let retrieved_json = serde_json::to_string(&retrieved).unwrap();
+        let retrieved_back: EventKind = serde_json::from_str(&retrieved_json).unwrap();
+        assert!(matches!(
+            retrieved_back,
+            EventKind::KnowledgeRetrieved {
+                note_count: 8,
+                context_tokens: 600,
+                ..
+            }
+        ));
+
+        let evaluated = EventKind::KnowledgeEvaluated {
+            health_score: 0.91,
+            note_count: 64,
+            contradictions: 1,
+            missing_pages: 2,
+            orphans: 3,
+        };
+        let evaluated_json = serde_json::to_string(&evaluated).unwrap();
+        let evaluated_back: EventKind = serde_json::from_str(&evaluated_json).unwrap();
+        assert!(matches!(
+            evaluated_back,
+            EventKind::KnowledgeEvaluated {
+                note_count: 64,
+                contradictions: 1,
+                missing_pages: 2,
+                orphans: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn memory_events_roundtrip() {
         let proposed = EventKind::MemoryProposed {
             scope: MemoryScope::Agent,
@@ -1952,6 +2097,16 @@ mod tests {
             }
             .variant_name(),
             "ErrorRaised"
+        );
+        assert_eq!(
+            EventKind::KnowledgeSearched {
+                query: "q".into(),
+                result_count: 1,
+                top_relevance: 0.5,
+                duration_ms: 10,
+            }
+            .variant_name(),
+            "KnowledgeSearched"
         );
         assert_eq!(
             EventKind::Custom {
