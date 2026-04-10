@@ -599,6 +599,7 @@ impl KernelRuntime {
             Ok(aios_protocol::ModelCompletion {
                 provider: "inline-proposed-tool".to_owned(),
                 model: "inline".to_owned(),
+                llm_call_record: None,
                 directives: vec![ModelDirective::ToolCall { call }],
                 stop_reason: aios_protocol::ModelStopReason::ToolCall,
                 usage: None,
@@ -623,6 +624,19 @@ impl KernelRuntime {
 
         match completion {
             Ok(completion) => {
+                if let Some(record) = completion.llm_call_record.clone() {
+                    self.append_event(
+                        session_id,
+                        branch_id,
+                        EventKind::Custom {
+                            event_type: "vigil.llm_call".to_owned(),
+                            data: record,
+                        },
+                    )
+                    .await?;
+                    emitted += 1;
+                }
+
                 let mut directive_count = 0_usize;
                 for directive in completion.directives {
                     directive_count += 1;

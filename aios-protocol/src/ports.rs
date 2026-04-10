@@ -81,6 +81,12 @@ pub enum ModelStopReason {
 pub struct ModelCompletion {
     pub provider: String,
     pub model: String,
+    /// Optional serialized LLM call envelope/economics record.
+    ///
+    /// Kept as JSON to avoid making the kernel contract depend on a concrete
+    /// observability crate while still allowing runtimes to persist the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_call_record: Option<serde_json::Value>,
     #[serde(default)]
     pub directives: Vec<ModelDirective>,
     pub stop_reason: ModelStopReason,

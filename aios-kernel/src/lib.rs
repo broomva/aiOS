@@ -44,6 +44,7 @@ impl ModelProviderPort for BaselineModelProvider {
         Ok(ModelCompletion {
             provider: "baseline".to_owned(),
             model: "baseline-deterministic".to_owned(),
+            llm_call_record: None,
             directives,
             stop_reason,
             usage: Some(TokenUsage {
