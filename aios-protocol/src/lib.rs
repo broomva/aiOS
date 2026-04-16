@@ -19,6 +19,7 @@
 //! - [`session`] — SessionManifest, BranchInfo, CheckpointManifest
 //! - [`payment`] — PaymentPort for agent financial operations (x402, MPP)
 //! - [`ports`] — Runtime boundary ports (event store, provider, tools, policy, approvals, memory)
+//! - [`rcs`] — Recursive Controlled Systems traits (Level, RecursiveControlledSystem, StabilityBudget)
 //! - [`error`] — KernelError, KernelResult
 
 pub mod error;
@@ -30,6 +31,7 @@ pub mod mode;
 pub mod payment;
 pub mod policy;
 pub mod ports;
+pub mod rcs;
 pub mod sandbox;
 pub mod session;
 pub mod state;
@@ -53,6 +55,10 @@ pub use payment::{
     PaymentSettlementReceipt, WalletBalanceInfo,
 };
 pub use policy::{Capability, PolicyEvaluation, PolicySet, SubscriptionTier};
+pub use rcs::{
+    Level, LyapunovCandidate, RecursiveControlledSystem, StabilityBreakdown, StabilityBudget, L0,
+    L1, L2, L3,
+};
 pub use ports::{
     ApprovalPort, ApprovalRequest, ApprovalResolution, ApprovalTicket, ConversationTurn,
     EventRecordStream, EventStorePort, ModelCompletion, ModelCompletionRequest, ModelDirective,
