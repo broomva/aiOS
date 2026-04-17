@@ -232,7 +232,12 @@ impl fmt::Display for StabilityBudget {
         write!(
             f,
             "λ = {:.4} [{status}]  (γ={:.3} − adapt={:.3} − design={:.3} − delay={:.3} − switch={:.3})",
-            m, self.decay_rate, self.adaptation_cost, self.design_cost, self.delay_cost, self.switching_cost
+            m,
+            self.decay_rate,
+            self.adaptation_cost,
+            self.design_cost,
+            self.delay_cost,
+            self.switching_cost
         )
     }
 }

@@ -55,15 +55,15 @@ pub use payment::{
     PaymentSettlementReceipt, WalletBalanceInfo,
 };
 pub use policy::{Capability, PolicyEvaluation, PolicySet, SubscriptionTier};
-pub use rcs::{
-    Level, LyapunovCandidate, RecursiveControlledSystem, StabilityBreakdown, StabilityBudget, L0,
-    L1, L2, L3,
-};
 pub use ports::{
     ApprovalPort, ApprovalRequest, ApprovalResolution, ApprovalTicket, ConversationTurn,
     EventRecordStream, EventStorePort, ModelCompletion, ModelCompletionRequest, ModelDirective,
     ModelProviderPort, ModelStopReason, PolicyGateDecision, PolicyGatePort, ToolExecutionReport,
     ToolExecutionRequest, ToolHarnessPort,
+};
+pub use rcs::{
+    L0, L1, L2, L3, Level, LyapunovCandidate, RecursiveControlledSystem, StabilityBreakdown,
+    StabilityBudget,
 };
 pub use sandbox::{NetworkPolicy, SandboxLimits, SandboxTier};
 pub use session::{
