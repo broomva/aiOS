@@ -643,6 +643,39 @@ pub enum EventKind {
         message: String,
     },
 
+    // ── Kernel events (kernel.*) ──
+    //
+    // First-class variants emitted by lifed / any `KernelPort` implementation.
+    // Each wraps a payload struct defined at the bottom of this file. See the
+    // 2026-04-23 lifed kernel daemon design spec §3.2 for the typing rationale
+    // (D4: "first-class, not Custom") and payload definitions.
+    /// A VM was created on a hypervisor backend.
+    KernelVmCreated(KernelVmCreated),
+    /// A VM was forked from a parent snapshot.
+    KernelVmForked(KernelVmForked),
+    /// A snapshot of a VM's filesystem and memory was captured.
+    KernelVmSnapshotted(KernelVmSnapshotted),
+    /// A VM was paused and its state persisted.
+    KernelVmHibernated(KernelVmHibernated),
+    /// A hibernated VM was resumed.
+    KernelVmResumed(KernelVmResumed),
+    /// A VM was torn down.
+    KernelVmDestroyed(KernelVmDestroyed),
+    /// A tool dispatch began executing inside a VM.
+    KernelDispatchStarted(KernelDispatchStarted),
+    /// A tool dispatch finished with an exit code and resource usage.
+    KernelDispatchCompleted(KernelDispatchCompleted),
+    /// A gate vetoed a dispatch before it could execute.
+    KernelDispatchDenied(KernelDispatchDenied),
+    /// A gate vetoed a VM fork before a child could be created.
+    KernelForkDenied(KernelForkDenied),
+    /// An egress flow was observed from a VM, for metering and audit.
+    KernelEgressRecorded(KernelEgressRecorded),
+    /// A policy gate detected a capability use the VM's policy forbids.
+    KernelPolicyViolated(KernelPolicyViolated),
+    /// Resource usage was attributed to a wallet for downstream settlement.
+    KernelUsageRecorded(KernelUsageRecorded),
+
     // ── Forward-compatible catch-all ──
     Custom {
         event_type: String,
@@ -731,6 +764,19 @@ impl EventKind {
             Self::Steered { .. } => "Steered",
             Self::QueueDrained { .. } => "QueueDrained",
             Self::ErrorRaised { .. } => "ErrorRaised",
+            Self::KernelVmCreated(_) => "KernelVmCreated",
+            Self::KernelVmForked(_) => "KernelVmForked",
+            Self::KernelVmSnapshotted(_) => "KernelVmSnapshotted",
+            Self::KernelVmHibernated(_) => "KernelVmHibernated",
+            Self::KernelVmResumed(_) => "KernelVmResumed",
+            Self::KernelVmDestroyed(_) => "KernelVmDestroyed",
+            Self::KernelDispatchStarted(_) => "KernelDispatchStarted",
+            Self::KernelDispatchCompleted(_) => "KernelDispatchCompleted",
+            Self::KernelDispatchDenied(_) => "KernelDispatchDenied",
+            Self::KernelForkDenied(_) => "KernelForkDenied",
+            Self::KernelEgressRecorded(_) => "KernelEgressRecorded",
+            Self::KernelPolicyViolated(_) => "KernelPolicyViolated",
+            Self::KernelUsageRecorded(_) => "KernelUsageRecorded",
             Self::Custom { .. } => "Custom",
         }
     }
@@ -1206,6 +1252,22 @@ enum EventKindKnown {
     ErrorRaised {
         message: String,
     },
+    // Kernel events (see `EventKind::Kernel*`) — mirrored here so the
+    // forward-compatible deserializer round-trips them as first-class
+    // variants instead of falling through to `Custom`.
+    KernelVmCreated(KernelVmCreated),
+    KernelVmForked(KernelVmForked),
+    KernelVmSnapshotted(KernelVmSnapshotted),
+    KernelVmHibernated(KernelVmHibernated),
+    KernelVmResumed(KernelVmResumed),
+    KernelVmDestroyed(KernelVmDestroyed),
+    KernelDispatchStarted(KernelDispatchStarted),
+    KernelDispatchCompleted(KernelDispatchCompleted),
+    KernelDispatchDenied(KernelDispatchDenied),
+    KernelForkDenied(KernelForkDenied),
+    KernelEgressRecorded(KernelEgressRecorded),
+    KernelPolicyViolated(KernelPolicyViolated),
+    KernelUsageRecorded(KernelUsageRecorded),
     Custom {
         event_type: String,
         data: serde_json::Value,
@@ -1772,7 +1834,599 @@ impl From<EventKindKnown> for EventKind {
                 processed,
             },
             EventKindKnown::ErrorRaised { message } => Self::ErrorRaised { message },
+            EventKindKnown::KernelVmCreated(p) => Self::KernelVmCreated(p),
+            EventKindKnown::KernelVmForked(p) => Self::KernelVmForked(p),
+            EventKindKnown::KernelVmSnapshotted(p) => Self::KernelVmSnapshotted(p),
+            EventKindKnown::KernelVmHibernated(p) => Self::KernelVmHibernated(p),
+            EventKindKnown::KernelVmResumed(p) => Self::KernelVmResumed(p),
+            EventKindKnown::KernelVmDestroyed(p) => Self::KernelVmDestroyed(p),
+            EventKindKnown::KernelDispatchStarted(p) => Self::KernelDispatchStarted(p),
+            EventKindKnown::KernelDispatchCompleted(p) => Self::KernelDispatchCompleted(p),
+            EventKindKnown::KernelDispatchDenied(p) => Self::KernelDispatchDenied(p),
+            EventKindKnown::KernelForkDenied(p) => Self::KernelForkDenied(p),
+            EventKindKnown::KernelEgressRecorded(p) => Self::KernelEgressRecorded(p),
+            EventKindKnown::KernelPolicyViolated(p) => Self::KernelPolicyViolated(p),
+            EventKindKnown::KernelUsageRecorded(p) => Self::KernelUsageRecorded(p),
             EventKindKnown::Custom { event_type, data } => Self::Custom { event_type, data },
+        }
+    }
+}
+
+// ─── Kernel event payloads ──────────────────────────────────────────────────
+//
+// First-class payload structs for the `Kernel*` variants of [`EventKind`].
+// Each variant of [`EventKind`] wraps the correspondingly-named payload
+// struct as a tuple variant; serde's internal-tagging (`#[serde(tag =
+// "type")]`) inlines the struct fields at the same level as `type`, so a
+// `KernelVmCreated` value serializes as
+// `{"type":"KernelVmCreated","vm_id":"…","backend":"…",…}`.
+//
+// All payload structs derive `Debug + Clone + PartialEq + Eq + Serialize +
+// Deserialize` so they compose cleanly with the existing `EventKind` shape
+// (which already derives `Debug + Clone + Serialize` and a manual
+// `Deserialize`).
+
+use crate::budget::ResourceUsage;
+use crate::hypervisor::{BackendId, VmId, VmSnapshotId};
+use crate::kernel::{GateKind, WalletAttribution};
+use crate::network_isolation::EgressTarget;
+
+/// Payload for [`EventKind::KernelVmCreated`]: a new VM was created on a
+/// hypervisor backend for the given session / agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelVmCreated {
+    /// Identifier of the newly-created VM.
+    pub vm_id: VmId,
+    /// Backend that hosts the VM (e.g. `"local"`, `"cube"`).
+    pub backend: BackendId,
+    /// Hash of the `VmSpec` the VM was created from (for reproducibility).
+    pub spec_hash: String,
+    /// Session the VM belongs to.
+    pub session_id: SessionId,
+    /// Agent the VM was created on behalf of.
+    pub agent_id: AgentId,
+}
+
+/// Payload for [`EventKind::KernelVmForked`]: a VM was forked from a parent
+/// snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelVmForked {
+    /// VM that was forked.
+    pub parent_vm_id: VmId,
+    /// Newly-created child VM.
+    pub child_vm_id: VmId,
+    /// Snapshot the child was forked from.
+    pub snapshot_id: VmSnapshotId,
+}
+
+/// Payload for [`EventKind::KernelVmSnapshotted`]: a snapshot of a VM's
+/// filesystem and memory was captured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelVmSnapshotted {
+    /// VM that was snapshotted.
+    pub vm_id: VmId,
+    /// Identifier of the newly-created snapshot.
+    pub snapshot_id: VmSnapshotId,
+    /// Human-readable snapshot name.
+    pub name: String,
+    /// Size of the snapshot on disk, in bytes.
+    pub size_bytes: u64,
+}
+
+/// Payload for [`EventKind::KernelVmHibernated`]: a VM was paused and its
+/// state persisted to disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelVmHibernated {
+    /// VM that was hibernated.
+    pub vm_id: VmId,
+}
+
+/// Payload for [`EventKind::KernelVmResumed`]: a hibernated VM was resumed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelVmResumed {
+    /// VM that was resumed.
+    pub vm_id: VmId,
+}
+
+/// Payload for [`EventKind::KernelVmDestroyed`]: a VM was torn down.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelVmDestroyed {
+    /// VM that was destroyed.
+    pub vm_id: VmId,
+    /// Human-readable reason for destruction (e.g. `"timeout"`, `"user"`).
+    pub reason: String,
+}
+
+/// Payload for [`EventKind::KernelDispatchStarted`]: a tool dispatch began
+/// executing inside a VM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelDispatchStarted {
+    /// VM the dispatch is running in.
+    pub vm_id: VmId,
+    /// Unique identifier for this dispatch call, stable across lifecycle.
+    pub call_id: String,
+    /// Name of the tool being dispatched.
+    pub tool_name: String,
+}
+
+/// Payload for [`EventKind::KernelDispatchCompleted`]: a tool dispatch
+/// finished, either successfully or with an exit code reported by the VM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelDispatchCompleted {
+    /// Dispatch this event is closing out.
+    pub call_id: String,
+    /// Resource consumption reported by the backend for this dispatch.
+    pub usage: ResourceUsage,
+    /// Exit code reported by the underlying process/VM. `0` means success.
+    pub exit_code: i32,
+}
+
+/// Payload for [`EventKind::KernelDispatchDenied`]: a gate vetoed a
+/// dispatch before it could execute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelDispatchDenied {
+    /// Dispatch the gate vetoed.
+    pub call_id: String,
+    /// Which gate issued the denial.
+    pub gate: GateKind,
+    /// Human-readable reason for the denial.
+    pub reason: String,
+}
+
+/// Payload for [`EventKind::KernelForkDenied`]: a gate vetoed a VM fork
+/// before a child could be created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelForkDenied {
+    /// VM that attempted to fork.
+    pub parent_vm_id: VmId,
+    /// Which gate issued the denial.
+    pub gate: GateKind,
+    /// Human-readable reason for the denial.
+    pub reason: String,
+}
+
+/// Payload for [`EventKind::KernelEgressRecorded`]: an egress flow was
+/// observed from a VM, for metering and audit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelEgressRecorded {
+    /// VM that generated the egress.
+    pub vm_id: VmId,
+    /// Bytes egressed (payload only — not including link-layer overhead).
+    pub bytes: u64,
+    /// Destination of the egress flow.
+    pub dst: EgressTarget,
+}
+
+/// Payload for [`EventKind::KernelPolicyViolated`]: a policy gate detected
+/// a capability use that the VM's policy forbids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelPolicyViolated {
+    /// VM that violated policy.
+    pub vm_id: VmId,
+    /// Capability string the VM attempted to exercise.
+    pub capability: String,
+    /// The concrete action that was blocked.
+    pub action: String,
+}
+
+/// Payload for [`EventKind::KernelUsageRecorded`]: resource usage was
+/// attributed to a wallet for settlement by Haima.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelUsageRecorded {
+    /// Session the usage occurred in.
+    pub session_id: SessionId,
+    /// Wallet to which the usage is attributed.
+    pub wallet: WalletAttribution,
+    /// Aggregated resource consumption for the reporting period.
+    pub usage: ResourceUsage,
+}
+
+#[cfg(test)]
+mod kernel_event_payload_tests {
+    use super::*;
+    use crate::budget::UsageConfidence;
+    use crate::kernel::ChainId;
+    use crate::network_isolation::EgressProtocol;
+
+    fn sample_usage() -> ResourceUsage {
+        ResourceUsage {
+            cpu_ms: 100,
+            mem_peak_kb: 2_048,
+            egress_bytes: 0,
+            duration_ms: 120,
+            syscall_count: 42,
+            confidence: UsageConfidence::Measured,
+        }
+    }
+
+    #[test]
+    fn kernel_vm_created_payload_roundtrip() {
+        let p = KernelVmCreated {
+            vm_id: VmId::from("vm-1"),
+            backend: BackendId::from("local"),
+            spec_hash: "deadbeef".into(),
+            session_id: SessionId::from_string("s1"),
+            agent_id: AgentId::from_string("a1"),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: KernelVmCreated = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn kernel_vm_forked_payload_roundtrip() {
+        let p = KernelVmForked {
+            parent_vm_id: VmId::from("vm-parent"),
+            child_vm_id: VmId::from("vm-child"),
+            snapshot_id: VmSnapshotId::from("snap-1"),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: KernelVmForked = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn kernel_vm_snapshotted_payload_roundtrip() {
+        let p = KernelVmSnapshotted {
+            vm_id: VmId::from("vm-1"),
+            snapshot_id: VmSnapshotId::from("snap-1"),
+            name: "post-init".into(),
+            size_bytes: 16_384,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: KernelVmSnapshotted = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn kernel_vm_hibernated_payload_roundtrip() {
+        let p = KernelVmHibernated {
+            vm_id: VmId::from("vm-1"),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: KernelVmHibernated = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn kernel_vm_resumed_payload_roundtrip() {
+        let p = KernelVmResumed {
+            vm_id: VmId::from("vm-1"),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: KernelVmResumed = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn kernel_vm_destroyed_payload_roundtrip() {
+        let p = KernelVmDestroyed {
+            vm_id: VmId::from("vm-1"),
+            reason: "timeout".into(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: KernelVmDestroyed = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn kernel_dispatch_started_payload_roundtrip() {
+        let p = KernelDispatchStarted {
+            vm_id: VmId::from("vm-1"),
+            call_id: "call-1".into(),
+            tool_name: "shell".into(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: KernelDispatchStarted = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn kernel_dispatch_completed_payload_roundtrip() {
+        let p = KernelDispatchCompleted {
+            call_id: "call-1".into(),
+            usage: sample_usage(),
+            exit_code: 0,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: KernelDispatchCompleted = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn kernel_dispatch_denied_payload_roundtrip() {
+        let p = KernelDispatchDenied {
+            call_id: "call-1".into(),
+            gate: GateKind::Budget,
+            reason: "over budget".into(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: KernelDispatchDenied = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn kernel_fork_denied_payload_roundtrip() {
+        let p = KernelForkDenied {
+            parent_vm_id: VmId::from("vm-parent"),
+            gate: GateKind::ForkLambda,
+            reason: "λ budget exceeded".into(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: KernelForkDenied = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn kernel_egress_recorded_payload_roundtrip() {
+        let p = KernelEgressRecorded {
+            vm_id: VmId::from("vm-1"),
+            bytes: 1_024,
+            dst: EgressTarget {
+                host: "api.anthropic.com".into(),
+                port: 443,
+                protocol: EgressProtocol::Tcp,
+            },
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: KernelEgressRecorded = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn kernel_policy_violated_payload_roundtrip() {
+        let p = KernelPolicyViolated {
+            vm_id: VmId::from("vm-1"),
+            capability: "net:connect".into(),
+            action: "connect tcp api.disallowed.com:443".into(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: KernelPolicyViolated = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn kernel_usage_recorded_payload_roundtrip() {
+        let p = KernelUsageRecorded {
+            session_id: SessionId::from_string("s1"),
+            wallet: WalletAttribution {
+                address: "0xabcdef".into(),
+                chain: ChainId::base(),
+            },
+            usage: sample_usage(),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: KernelUsageRecorded = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    // ── EventKind integration tests ─────────────────────────────────────────
+
+    /// Serde's internal-tagging (`#[serde(tag = "type")]`) on an enum with a
+    /// tuple variant whose payload is a struct inlines the struct fields at
+    /// the same level as `type`. This test locks that wire shape in so a
+    /// future refactor cannot silently break the on-disk/on-wire contract
+    /// consumed by Lago, Vigil, and external agents.
+    #[test]
+    fn kernel_vm_created_event_kind_wire_shape() {
+        let kind = EventKind::KernelVmCreated(KernelVmCreated {
+            vm_id: VmId::from("vm-1"),
+            backend: BackendId::from("local"),
+            spec_hash: "deadbeef".into(),
+            session_id: SessionId::from_string("s1"),
+            agent_id: AgentId::from_string("a1"),
+        });
+        let json = serde_json::to_string(&kind).unwrap();
+        assert!(
+            json.contains(r#""type":"KernelVmCreated""#),
+            "expected internal tag inlined, got: {json}"
+        );
+        // The payload fields must be at the top level, not nested under a key.
+        assert!(
+            json.contains(r#""vm_id":"vm-1""#),
+            "payload not inlined: {json}"
+        );
+        assert!(
+            json.contains(r#""backend":"local""#),
+            "payload not inlined: {json}"
+        );
+    }
+
+    #[test]
+    fn kernel_vm_created_event_kind_roundtrip() {
+        let payload = KernelVmCreated {
+            vm_id: VmId::from("vm-1"),
+            backend: BackendId::from("local"),
+            spec_hash: "deadbeef".into(),
+            session_id: SessionId::from_string("s1"),
+            agent_id: AgentId::from_string("a1"),
+        };
+        let kind = EventKind::KernelVmCreated(payload.clone());
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        match back {
+            EventKind::KernelVmCreated(got) => assert_eq!(got, payload),
+            other => panic!("expected KernelVmCreated, got {}", other.variant_name()),
+        }
+    }
+
+    #[test]
+    fn kernel_vm_destroyed_event_kind_roundtrip() {
+        let payload = KernelVmDestroyed {
+            vm_id: VmId::from("vm-1"),
+            reason: "timeout".into(),
+        };
+        let kind = EventKind::KernelVmDestroyed(payload.clone());
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        match back {
+            EventKind::KernelVmDestroyed(got) => assert_eq!(got, payload),
+            other => panic!("expected KernelVmDestroyed, got {}", other.variant_name()),
+        }
+    }
+
+    #[test]
+    fn kernel_dispatch_completed_event_kind_roundtrip() {
+        let payload = KernelDispatchCompleted {
+            call_id: "call-1".into(),
+            usage: sample_usage(),
+            exit_code: 0,
+        };
+        let kind = EventKind::KernelDispatchCompleted(payload.clone());
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        match back {
+            EventKind::KernelDispatchCompleted(got) => assert_eq!(got, payload),
+            other => panic!(
+                "expected KernelDispatchCompleted, got {}",
+                other.variant_name()
+            ),
+        }
+    }
+
+    #[test]
+    fn kernel_egress_recorded_event_kind_roundtrip() {
+        let payload = KernelEgressRecorded {
+            vm_id: VmId::from("vm-1"),
+            bytes: 1_024,
+            dst: EgressTarget {
+                host: "api.anthropic.com".into(),
+                port: 443,
+                protocol: EgressProtocol::Tcp,
+            },
+        };
+        let kind = EventKind::KernelEgressRecorded(payload.clone());
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: EventKind = serde_json::from_str(&json).unwrap();
+        match back {
+            EventKind::KernelEgressRecorded(got) => assert_eq!(got, payload),
+            other => panic!(
+                "expected KernelEgressRecorded, got {}",
+                other.variant_name()
+            ),
+        }
+    }
+
+    /// Locks in `variant_name` output for every kernel variant. If a new
+    /// Kernel* variant is added without a `variant_name` arm, the match in
+    /// `EventKind::variant_name` will fail to compile — but this test also
+    /// catches the inverse (arm added but no case in this table).
+    #[test]
+    fn kernel_variant_name_lookup() {
+        let cases: Vec<(EventKind, &'static str)> = vec![
+            (
+                EventKind::KernelVmCreated(KernelVmCreated {
+                    vm_id: VmId::from("v"),
+                    backend: BackendId::from("b"),
+                    spec_hash: String::new(),
+                    session_id: SessionId::from_string("s"),
+                    agent_id: AgentId::from_string("a"),
+                }),
+                "KernelVmCreated",
+            ),
+            (
+                EventKind::KernelVmForked(KernelVmForked {
+                    parent_vm_id: VmId::from("p"),
+                    child_vm_id: VmId::from("c"),
+                    snapshot_id: VmSnapshotId::from("s"),
+                }),
+                "KernelVmForked",
+            ),
+            (
+                EventKind::KernelVmSnapshotted(KernelVmSnapshotted {
+                    vm_id: VmId::from("v"),
+                    snapshot_id: VmSnapshotId::from("s"),
+                    name: String::new(),
+                    size_bytes: 0,
+                }),
+                "KernelVmSnapshotted",
+            ),
+            (
+                EventKind::KernelVmHibernated(KernelVmHibernated {
+                    vm_id: VmId::from("v"),
+                }),
+                "KernelVmHibernated",
+            ),
+            (
+                EventKind::KernelVmResumed(KernelVmResumed {
+                    vm_id: VmId::from("v"),
+                }),
+                "KernelVmResumed",
+            ),
+            (
+                EventKind::KernelVmDestroyed(KernelVmDestroyed {
+                    vm_id: VmId::from("v"),
+                    reason: String::new(),
+                }),
+                "KernelVmDestroyed",
+            ),
+            (
+                EventKind::KernelDispatchStarted(KernelDispatchStarted {
+                    vm_id: VmId::from("v"),
+                    call_id: String::new(),
+                    tool_name: String::new(),
+                }),
+                "KernelDispatchStarted",
+            ),
+            (
+                EventKind::KernelDispatchCompleted(KernelDispatchCompleted {
+                    call_id: String::new(),
+                    usage: sample_usage(),
+                    exit_code: 0,
+                }),
+                "KernelDispatchCompleted",
+            ),
+            (
+                EventKind::KernelDispatchDenied(KernelDispatchDenied {
+                    call_id: String::new(),
+                    gate: GateKind::Policy,
+                    reason: String::new(),
+                }),
+                "KernelDispatchDenied",
+            ),
+            (
+                EventKind::KernelForkDenied(KernelForkDenied {
+                    parent_vm_id: VmId::from("p"),
+                    gate: GateKind::ForkLambda,
+                    reason: String::new(),
+                }),
+                "KernelForkDenied",
+            ),
+            (
+                EventKind::KernelEgressRecorded(KernelEgressRecorded {
+                    vm_id: VmId::from("v"),
+                    bytes: 0,
+                    dst: EgressTarget {
+                        host: String::new(),
+                        port: 0,
+                        protocol: EgressProtocol::Tcp,
+                    },
+                }),
+                "KernelEgressRecorded",
+            ),
+            (
+                EventKind::KernelPolicyViolated(KernelPolicyViolated {
+                    vm_id: VmId::from("v"),
+                    capability: String::new(),
+                    action: String::new(),
+                }),
+                "KernelPolicyViolated",
+            ),
+            (
+                EventKind::KernelUsageRecorded(KernelUsageRecorded {
+                    session_id: SessionId::from_string("s"),
+                    wallet: WalletAttribution {
+                        address: String::new(),
+                        chain: ChainId::base(),
+                    },
+                    usage: sample_usage(),
+                }),
+                "KernelUsageRecorded",
+            ),
+        ];
+        assert_eq!(cases.len(), 13);
+        for (kind, expected) in cases {
+            assert_eq!(kind.variant_name(), expected);
         }
     }
 }

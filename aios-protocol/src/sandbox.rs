@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 /// Sandbox isolation tiers, ordered from least to most isolated.
 ///
 /// Derives `PartialOrd`/`Ord` so comparisons like `tier >= SandboxTier::Process`
-/// work naturally for policy enforcement.
+/// work naturally for policy enforcement. Variant order is load-bearing:
+/// the derived `Ord` ranks tiers by declaration order, so new tiers MUST be
+/// appended (never inserted).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
 )]
@@ -24,6 +26,18 @@ pub enum SandboxTier {
     Process,
     /// Full container isolation (e.g. Apple Containers, Docker).
     Container,
+    /// Hardware-isolated micro-VM (e.g. Cloud Hypervisor, Firecracker).
+    ///
+    /// The strongest tier on the scale — separate kernel, separate address
+    /// space, independent resource accounting. Used by `lifed` as the
+    /// default tier for agent VMs emitted by the kernel daemon.
+    ///
+    /// Serialized as `"micro_vm"` (explicit `rename` override — serde's
+    /// default `snake_case` conversion would emit `"micro_v_m"` for
+    /// PascalCase `MicroVM`, which reads poorly and does not match the
+    /// upstream spec wire shape).
+    #[serde(rename = "micro_vm")]
+    MicroVM,
 }
 
 /// Resource limits for sandboxed command execution.
@@ -89,6 +103,7 @@ mod tests {
             SandboxTier::Basic,
             SandboxTier::Process,
             SandboxTier::Container,
+            SandboxTier::MicroVM,
         ] {
             let json = serde_json::to_string(&tier).unwrap();
             let back: SandboxTier = serde_json::from_str(&json).unwrap();
@@ -101,6 +116,23 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SandboxTier::Container).unwrap(),
             "\"container\""
+        );
+    }
+
+    #[test]
+    fn microvm_is_highest_tier() {
+        // Lock in the ordering contract: MicroVM must sit above every other
+        // tier. Downstream policy code relies on this to express "isolate
+        // at least as strongly as X" comparisons.
+        assert!(SandboxTier::MicroVM > SandboxTier::Container);
+        assert!(SandboxTier::Container > SandboxTier::Process);
+        assert!(SandboxTier::Process > SandboxTier::Basic);
+        assert!(SandboxTier::Basic > SandboxTier::None);
+        // And lock in the serde name — `rename_all = "snake_case"` turns
+        // PascalCase variants into snake_case on the wire.
+        assert_eq!(
+            serde_json::to_string(&SandboxTier::MicroVM).unwrap(),
+            "\"micro_vm\""
         );
     }
 

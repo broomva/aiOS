@@ -138,7 +138,7 @@ pub struct ApprovalRequest {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalTicket {
     pub approval_id: ApprovalId,
     pub session_id: SessionId,
@@ -213,4 +213,135 @@ pub trait ApprovalPort: Send + Sync {
         approved: bool,
         actor: String,
     ) -> KernelResult<ApprovalResolution>;
+}
+
+// Re-export the hypervisor trait family for consistency with the other ports.
+// Traits are *defined* in [`crate::hypervisor`]; this block only re-exports so
+// callers can reach `aios_protocol::ports::HypervisorBackend` alongside the
+// other runtime-boundary traits.
+pub use crate::budget::{BudgetDecision, BudgetGatePort};
+pub use crate::hypervisor::{HypervisorBackend, HypervisorFilesystemExt};
+pub use crate::network_isolation::NetworkIsolationPort;
+
+// ── KernelPort ───────────────────────────────────────────────────────────────
+
+// Scoped sub-module so the richer kernel-tier `KernelResult` (and fresh
+// imports of `ToolResult` + hypervisor types) coexist with the legacy
+// `error::KernelResult` used by the ports above without a rename shim.
+// Exposed through the `pub use kernel_port::KernelPort;` below.
+mod kernel_port {
+    use super::ToolCall;
+    use crate::hypervisor::{ForkSpec, VmHandle, VmSnapshotHandle, VmSpec};
+    use crate::kernel::{KernelContext, KernelResult};
+    use crate::tool::ToolResult;
+
+    /// High-level Tool-ABI dispatch into an isolated VM.
+    ///
+    /// This is the trait callers depend on — `arcand` today, Life Runtime
+    /// library in Spec B tomorrow — and the canonical surface `lifed`
+    /// implements. Everything lower-level (raw VM lifecycle, shell exec,
+    /// filesystem) sits behind [`crate::hypervisor::HypervisorBackend`] and
+    /// is orchestrated by the `lifed` implementation of this trait.
+    ///
+    /// ## Shared-ref only
+    ///
+    /// None of these methods take `&mut self`: callers hold
+    /// `Arc<dyn KernelPort>` and dispatch concurrently across many VMs.
+    /// State lives inside the implementation (typically behind interior
+    /// mutability or a dedicated runtime actor); the trait itself is a
+    /// read-only handle.
+    ///
+    /// ## Ownership semantics
+    ///
+    /// - [`destroy`](KernelPort::destroy) takes `VmHandle` by value
+    ///   because the handle must not be reused after the call — callers
+    ///   that still need the ID should clone it before dispatching.
+    /// - [`create_vm`](KernelPort::create_vm) / [`fork`](KernelPort::fork)
+    ///   take `KernelContext` by value because the context is per-call
+    ///   and conceptually moves into the resulting lifetime of the new VM.
+    /// - Hot-path methods ([`dispatch`](KernelPort::dispatch),
+    ///   [`snapshot`](KernelPort::snapshot),
+    ///   [`hibernate`](KernelPort::hibernate),
+    ///   [`resume`](KernelPort::resume)) take handles by shared reference
+    ///   so the same VM can be kept alive across many dispatches.
+    ///
+    /// ## Error surface
+    ///
+    /// Returns [`crate::kernel::KernelResult`] (the richer kernel-tier
+    /// error), *not* the legacy [`crate::error::KernelResult`] used by
+    /// the older ports (`EventStorePort`, `ModelProviderPort`, …). Those
+    /// ports migrate in BRO-856.
+    #[async_trait::async_trait]
+    pub trait KernelPort: Send + Sync {
+        /// Provision a new VM from `spec` under the attribution / budget
+        /// hints carried by `ctx`. Returns a live handle; the VM may
+        /// still be in [`crate::hypervisor::VmStatus::Starting`] when the
+        /// call returns.
+        async fn create_vm(&self, spec: VmSpec, ctx: KernelContext) -> KernelResult<VmHandle>;
+
+        /// Dispatch a [`ToolCall`] against a running VM and return its
+        /// [`ToolResult`]. Hot-path entry point gated by
+        /// [`crate::budget::BudgetGatePort`] and — when the backend has
+        /// network I/O — [`crate::network_isolation::NetworkIsolationPort`].
+        async fn dispatch(
+            &self,
+            vm: &VmHandle,
+            call: ToolCall,
+            ctx: &KernelContext,
+        ) -> KernelResult<ToolResult>;
+
+        /// Snapshot the current VM state under the human-readable `name`
+        /// (used for fork labels, audit events, and operator UX). The
+        /// returned handle can be passed to [`fork`](KernelPort::fork) or
+        /// archived for later restore.
+        async fn snapshot(&self, vm: &VmHandle, name: &str) -> KernelResult<VmSnapshotHandle>;
+
+        /// Fork a new VM from `snapshot` with the overrides in `spec`.
+        /// Fork gating is stricter than dispatch gating because unbounded
+        /// forks can amplify cost exponentially — see
+        /// [`crate::budget::BudgetGatePort::check_fork`].
+        async fn fork(
+            &self,
+            snapshot: &VmSnapshotHandle,
+            spec: ForkSpec,
+            ctx: KernelContext,
+        ) -> KernelResult<VmHandle>;
+
+        /// Pause the VM and persist its state. Backends that do not
+        /// support hibernation surface
+        /// [`crate::kernel::KernelError::Backend`] wrapping
+        /// [`crate::hypervisor::BackendError::NotSupported`].
+        async fn hibernate(&self, vm: &VmHandle) -> KernelResult<()>;
+
+        /// Resume a previously hibernated VM. Returns the live handle
+        /// for the resumed instance (which may differ from the
+        /// pre-hibernate handle, e.g. after a controller restart).
+        async fn resume(&self, vm: &VmHandle) -> KernelResult<VmHandle>;
+
+        /// Destroy the VM. Takes the handle by value so stale handles
+        /// cannot be re-used after destruction. MUST succeed even if the
+        /// VM is already stopped.
+        async fn destroy(&self, vm: VmHandle) -> KernelResult<()>;
+    }
+}
+
+pub use kernel_port::KernelPort;
+
+#[cfg(test)]
+mod trait_tests {
+    use super::*;
+
+    // Compile-time assertion that `KernelPort` is dyn-compatible — the whole
+    // reason we use `#[async_trait]` instead of native async fn. Callers
+    // hold `Arc<dyn KernelPort>`; if this ever regresses, every caller
+    // breaks.
+    #[allow(dead_code)]
+    fn _assert_dyn(_: &dyn KernelPort) {}
+
+    #[test]
+    fn kernel_port_is_dyn_compatible() {
+        // If this compiles, the trait is dyn-compatible.
+        #[allow(dead_code)]
+        fn _use_it(_: &dyn KernelPort) {}
+    }
 }

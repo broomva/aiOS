@@ -132,7 +132,7 @@ pub enum ToolContent {
 /// typed content blocks for richer responses.
 ///
 /// For the simplified kernel-level outcome, see [`ToolOutcome`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ToolResult {
     pub call_id: String,
     pub tool_name: String,
@@ -145,6 +145,12 @@ pub struct ToolResult {
     /// Whether this result represents an error (MCP: isError).
     #[serde(default)]
     pub is_error: bool,
+    /// Optional kernel-tier resource usage reported by the backend.
+    ///
+    /// Populated by kernel dispatch paths (see [`crate::budget::ResourceUsage`]).
+    /// Legacy tool runtimes leave this `None`; additive and backward-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::budget::ResourceUsage>,
 }
 
 impl ToolResult {
@@ -158,6 +164,7 @@ impl ToolResult {
                 text: text.to_string(),
             }]),
             is_error: false,
+            usage: None,
         }
     }
 
@@ -173,6 +180,7 @@ impl ToolResult {
             output: value.clone(),
             content: Some(vec![ToolContent::Json { value }]),
             is_error: false,
+            usage: None,
         }
     }
 
@@ -186,6 +194,7 @@ impl ToolResult {
                 text: message.to_string(),
             }]),
             is_error: true,
+            usage: None,
         }
     }
 }
@@ -213,12 +222,28 @@ impl From<&ToolResult> for ToolOutcome {
 /// Context provided to a tool during execution.
 ///
 /// Contains the identifiers for the current run, session, and iteration
-/// so tools can correlate their actions with the agent loop.
-#[derive(Debug, Clone)]
+/// so tools can correlate their actions with the agent loop. Kernel-tier
+/// execution paths additionally populate [`Self::wallet`], [`Self::cost_hint`],
+/// and [`Self::kernel_ctx`] so tool implementations can propagate attribution
+/// and budget signals to downstream metering / gating.
+///
+/// All kernel-tier fields are optional and additive: legacy tools that do not
+/// care about attribution continue to work unchanged, and the serialized form
+/// stays compatible with consumers deserializing the pre-kernel shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolContext {
     pub run_id: String,
     pub session_id: String,
     pub iteration: u32,
+    /// Wallet attribution for on-chain settlement of this tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet: Option<crate::kernel::WalletAttribution>,
+    /// Advisory cost hint consulted by the kernel budget gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_hint: Option<crate::budget::ResourceBudget>,
+    /// Kernel-tier dispatch context (session, agent, trace, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_ctx: Option<crate::kernel::KernelContext>,
 }
 
 // ── Tool errors ───────────────────────────────────────────────────────
@@ -508,6 +533,7 @@ mod tests {
                 text: "success".into(),
             }]),
             is_error: false,
+            usage: None,
         };
         let json_str = serde_json::to_string(&result).unwrap();
         let back: ToolResult = serde_json::from_str(&json_str).unwrap();
@@ -596,6 +622,7 @@ mod tests {
             run_id: "run-1".into(),
             session_id: "sess-1".into(),
             iteration: 1,
+            ..Default::default()
         }
     }
 
@@ -692,5 +719,154 @@ mod tests {
             timeout_secs: 30,
         };
         assert_eq!(err.to_string(), "[slow] timed out after 30s");
+    }
+}
+
+// ── Kernel-tier additive-field tests ──────────────────────────────────
+//
+// These live in their own submodule so the ToolContext / ToolResult
+// legacy behavior is easy to locate and the kernel-tier coverage is
+// explicit.
+#[cfg(test)]
+mod kernel_ext_tests {
+    use super::*;
+
+    #[test]
+    fn tool_context_default_has_none_kernel_fields() {
+        let ctx = ToolContext::default();
+        assert!(ctx.wallet.is_none());
+        assert!(ctx.cost_hint.is_none());
+        assert!(ctx.kernel_ctx.is_none());
+        assert_eq!(ctx.iteration, 0);
+        assert!(ctx.run_id.is_empty());
+        assert!(ctx.session_id.is_empty());
+    }
+
+    #[test]
+    fn tool_context_serializes_without_kernel_fields_when_none() {
+        let ctx = ToolContext {
+            run_id: "r1".into(),
+            session_id: "s1".into(),
+            iteration: 3,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(json.contains("\"run_id\":\"r1\""));
+        assert!(json.contains("\"session_id\":\"s1\""));
+        assert!(json.contains("\"iteration\":3"));
+        // skip_serializing_if should strip the optional kernel fields.
+        assert!(!json.contains("wallet"));
+        assert!(!json.contains("cost_hint"));
+        assert!(!json.contains("kernel_ctx"));
+    }
+
+    #[test]
+    fn tool_context_deserializes_legacy_shape() {
+        // Legacy JSON produced before the kernel-tier fields existed must
+        // still deserialize cleanly — the promise of additive extensions.
+        let legacy = r#"{"run_id":"r1","session_id":"s1","iteration":3}"#;
+        let ctx: ToolContext = serde_json::from_str(legacy).unwrap();
+        assert_eq!(ctx.run_id, "r1");
+        assert_eq!(ctx.session_id, "s1");
+        assert_eq!(ctx.iteration, 3);
+        assert!(ctx.wallet.is_none());
+        assert!(ctx.cost_hint.is_none());
+        assert!(ctx.kernel_ctx.is_none());
+    }
+
+    #[test]
+    fn tool_context_roundtrip_with_kernel_fields() {
+        use crate::budget::ResourceBudget;
+        use crate::kernel::{ChainId, WalletAttribution};
+
+        let ctx = ToolContext {
+            run_id: "r1".into(),
+            session_id: "s1".into(),
+            iteration: 7,
+            wallet: Some(WalletAttribution {
+                address: "0xabcdef".into(),
+                chain: ChainId::base(),
+            }),
+            cost_hint: Some(ResourceBudget {
+                max_cpu_ms: Some(500),
+                ..Default::default()
+            }),
+            kernel_ctx: None,
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(json.contains("\"wallet\""));
+        assert!(json.contains("\"cost_hint\""));
+
+        let back: ToolContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.run_id, "r1");
+        assert_eq!(back.iteration, 7);
+        let wallet = back.wallet.expect("wallet roundtrips");
+        assert_eq!(wallet.address, "0xabcdef");
+        assert_eq!(wallet.chain, ChainId::base());
+        let cost_hint = back.cost_hint.expect("cost_hint roundtrips");
+        assert_eq!(cost_hint.max_cpu_ms, Some(500));
+    }
+
+    #[test]
+    fn tool_result_default_usage_is_none() {
+        let r = ToolResult::default();
+        assert!(r.usage.is_none());
+        assert_eq!(r.call_id, "");
+        assert_eq!(r.tool_name, "");
+        assert!(r.content.is_none());
+        assert!(!r.is_error);
+    }
+
+    #[test]
+    fn tool_result_helpers_leave_usage_none() {
+        let text = ToolResult::text("c1", "t", "hello");
+        assert!(text.usage.is_none());
+        let json_r = ToolResult::json("c2", "t", serde_json::json!({"ok": true}));
+        assert!(json_r.usage.is_none());
+        let err = ToolResult::error("c3", "t", "boom");
+        assert!(err.usage.is_none());
+    }
+
+    #[test]
+    fn tool_result_deserializes_legacy_shape() {
+        let legacy = r#"{"call_id":"c1","tool_name":"t","output":{"foo":1},"is_error":false}"#;
+        let r: ToolResult = serde_json::from_str(legacy).unwrap();
+        assert_eq!(r.call_id, "c1");
+        assert_eq!(r.tool_name, "t");
+        assert!(r.usage.is_none());
+    }
+
+    #[test]
+    fn tool_result_serializes_without_usage_when_none() {
+        let r = ToolResult::text("c1", "t", "hello");
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("usage"));
+    }
+
+    #[test]
+    fn tool_result_roundtrip_with_usage() {
+        use crate::budget::{ResourceUsage, UsageConfidence};
+        let r = ToolResult {
+            usage: Some(ResourceUsage {
+                cpu_ms: 100,
+                mem_peak_kb: 2048,
+                egress_bytes: 512,
+                duration_ms: 120,
+                syscall_count: 42,
+                confidence: UsageConfidence::Measured,
+            }),
+            ..ToolResult::text("c1", "t", "hello")
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"usage\""));
+        let back: ToolResult = serde_json::from_str(&json).unwrap();
+        let usage = back.usage.as_ref().expect("usage roundtrips");
+        assert_eq!(usage.cpu_ms, 100);
+        assert_eq!(usage.mem_peak_kb, 2048);
+        assert_eq!(usage.egress_bytes, 512);
+        assert_eq!(usage.duration_ms, 120);
+        assert_eq!(usage.syscall_count, 42);
+        assert_eq!(usage.confidence, UsageConfidence::Measured);
+        assert_eq!(back, r);
     }
 }
