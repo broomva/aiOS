@@ -32,7 +32,7 @@ pub struct RelayFrame {
 }
 
 mod bytes_as_base64 {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use bytes::Bytes;
     use serde::{Deserialize, Deserializer, Serializer};
 

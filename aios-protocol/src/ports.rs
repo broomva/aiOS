@@ -376,18 +376,10 @@ pub trait IdentityPort: Send + Sync {
     async fn get_soul(&self, agent: AgentId) -> KernelResult<SoulProfile>;
 
     /// Apply a partial [`SoulUpdate`] to `agent` and return the updated profile.
-    async fn update_soul(
-        &self,
-        agent: AgentId,
-        update: SoulUpdate,
-    ) -> KernelResult<SoulProfile>;
+    async fn update_soul(&self, agent: AgentId, update: SoulUpdate) -> KernelResult<SoulProfile>;
 
     /// Query the belief store for `agent`, narrowed by `filter`.
-    async fn get_beliefs(
-        &self,
-        agent: AgentId,
-        filter: BeliefFilter,
-    ) -> KernelResult<Vec<Belief>>;
+    async fn get_beliefs(&self, agent: AgentId, filter: BeliefFilter) -> KernelResult<Vec<Belief>>;
 }
 
 #[cfg(test)]
@@ -461,11 +453,7 @@ pub trait BlobStorePort: Send + Sync {
 #[async_trait]
 pub trait BillingPort: Send + Sync {
     async fn record_usage(&self, usage: UsageRecord) -> KernelResult<()>;
-    async fn get_invoice(
-        &self,
-        tenant: TenantId,
-        period: BillingPeriod,
-    ) -> KernelResult<Invoice>;
+    async fn get_invoice(&self, tenant: TenantId, period: BillingPeriod) -> KernelResult<Invoice>;
 }
 
 #[cfg(test)]
