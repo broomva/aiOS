@@ -91,6 +91,69 @@ impl AgentIdentityProvider for BasicIdentity {
     }
 }
 
+/// A belief held by the agent about itself, its environment, or other entities.
+///
+/// Beliefs form the agent's world model — epistemically graded propositions
+/// that can be reinforced, weakened, or contradicted over time.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct Belief {
+    /// Stable identifier for this belief (e.g. a ULID or UUID string).
+    pub id: String,
+    /// The entity or concept this belief is about (e.g. `"self"`, `"user"`, `"market"`).
+    pub subject: String,
+    /// The factual or evaluative claim being asserted.
+    pub proposition: String,
+    /// Confidence in `[0.0, 1.0]`. Defaults to 1.0 when not specified.
+    #[serde(default)]
+    pub confidence: f32,
+    /// When this belief was first observed / last reinforced.
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+    /// IDs of other beliefs that support (corroborate) this one.
+    #[serde(default)]
+    pub supports: Vec<String>,
+    /// IDs of other beliefs that contradict this one.
+    #[serde(default)]
+    pub contradicts: Vec<String>,
+}
+
+/// Filter parameters for querying an agent's belief store.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct BeliefFilter {
+    /// Restrict to beliefs whose `subject` equals this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// Only return beliefs whose `confidence` is at or above this threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_confidence: Option<f32>,
+    /// Only return beliefs observed at or after this timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Maximum number of beliefs to return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// A partial update to an agent's [`SoulProfile`].
+///
+/// Only non-`None` / non-empty fields are applied; absent fields are left
+/// unchanged, allowing callers to patch a single attribute without reading
+/// the full profile first.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct SoulUpdate {
+    /// Replace the agent's display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Trait tags to add to the agent's personality description.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_traits: Vec<String>,
+    /// Trait tags to remove from the agent's personality description.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove_traits: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

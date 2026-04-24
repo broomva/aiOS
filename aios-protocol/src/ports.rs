@@ -359,6 +359,47 @@ mod session_port_tests {
     }
 }
 
+// ── IdentityPort ─────────────────────────────────────────────────────────────
+
+use crate::identity::{Belief, BeliefFilter, SoulUpdate};
+use crate::ids::AgentId;
+use crate::memory::SoulProfile;
+
+/// High-level identity and belief management port.
+///
+/// Implementors provide soul-profile CRUD and belief-store access for an
+/// agent. `anima-core` is the reference implementation; `life-kernel-facade`
+/// consumes this trait through `Arc<dyn IdentityPort>`.
+#[async_trait]
+pub trait IdentityPort: Send + Sync {
+    /// Fetch the current [`SoulProfile`] for `agent`.
+    async fn get_soul(&self, agent: AgentId) -> KernelResult<SoulProfile>;
+
+    /// Apply a partial [`SoulUpdate`] to `agent` and return the updated profile.
+    async fn update_soul(
+        &self,
+        agent: AgentId,
+        update: SoulUpdate,
+    ) -> KernelResult<SoulProfile>;
+
+    /// Query the belief store for `agent`, narrowed by `filter`.
+    async fn get_beliefs(
+        &self,
+        agent: AgentId,
+        filter: BeliefFilter,
+    ) -> KernelResult<Vec<Belief>>;
+}
+
+#[cfg(test)]
+mod identity_port_tests {
+    use super::*;
+
+    #[test]
+    fn _assert_identity_port_dyn_safe() {
+        fn _dyn_safe(_p: &dyn IdentityPort) {}
+    }
+}
+
 #[cfg(test)]
 mod trait_tests {
     use super::*;
