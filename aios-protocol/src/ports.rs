@@ -414,7 +414,7 @@ mod trait_tests {
 // ── Lago port family ─────────────────────────────────────────────────────────
 
 use crate::billing::{BillingPeriod, Invoice, TenantId, UsageRecord};
-use crate::blob::{BlobHash as BlobDtoHash, BlobMetadata};
+use crate::blob::{BlobHash, BlobMetadata};
 use crate::knowledge::{KnowledgeQuery, KnowledgeSearchResult, Note, NoteDraft, NoteEdge, NoteId};
 
 /// High-level knowledge index + wikilink graph port.
@@ -441,9 +441,9 @@ pub trait BlobStorePort: Send + Sync {
         &self,
         payload: bytes::Bytes,
         content_type: Option<String>,
-    ) -> KernelResult<BlobDtoHash>;
-    async fn get(&self, hash: BlobDtoHash) -> KernelResult<bytes::Bytes>;
-    async fn head(&self, hash: BlobDtoHash) -> KernelResult<BlobMetadata>;
+    ) -> KernelResult<BlobHash>;
+    async fn get(&self, hash: BlobHash) -> KernelResult<bytes::Bytes>;
+    async fn head(&self, hash: BlobHash) -> KernelResult<BlobMetadata>;
 }
 
 /// Per-tenant usage metering and invoicing port.
