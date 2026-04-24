@@ -57,6 +57,7 @@ pub mod sandbox;
 pub mod session;
 pub mod state;
 pub mod tool;
+pub mod world;
 
 // Re-export the most commonly used types at the crate root.
 pub use budget::{BudgetDecision, BudgetGatePort, ResourceBudget, ResourceUsage, UsageConfidence};

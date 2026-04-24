@@ -599,3 +599,41 @@ mod finance_port_tests {
         fn _dyn_safe(_p: &dyn FinancePort) {}
     }
 }
+
+// ── WorldPort ─────────────────────────────────────────────────────────────────
+
+use crate::world::{WorldEvent, WorldId, WorldMutation, WorldSnapshot, WorldVersion};
+
+/// High-level world state port.
+///
+/// Implementors provide snapshot queries, state mutations, and event streaming
+/// for a named world. `opsisd` is the reference implementation;
+/// `life-kernel-facade` consumes this trait through `Arc<dyn WorldPort>`.
+#[async_trait]
+pub trait WorldPort: Send + Sync {
+    /// Return the current state snapshot for `world`.
+    async fn snapshot(&self, world: WorldId) -> KernelResult<WorldSnapshot>;
+
+    /// Apply a mutation to `world` and return the resulting version.
+    async fn mutate(&self, world: WorldId, mutation: WorldMutation) -> KernelResult<WorldVersion>;
+
+    /// Open a stream of world events for `world` starting after `after_version`.
+    ///
+    /// The stream is `'static` so it can be held across `.await` points
+    /// without a borrow on `self`.
+    async fn subscribe(
+        &self,
+        world: WorldId,
+        after_version: u64,
+    ) -> KernelResult<BoxStream<'static, KernelResult<WorldEvent>>>;
+}
+
+#[cfg(test)]
+mod world_port_tests {
+    use super::*;
+
+    #[test]
+    fn _assert_world_port_dyn_safe() {
+        fn _dyn_safe(_p: &dyn WorldPort) {}
+    }
+}
