@@ -33,6 +33,8 @@
 //! - [`network_isolation`] — EgressTarget, EgressProtocol, NetworkIsolationPort
 //!   (egress metering + per-VM enforcement)
 
+pub mod billing;
+pub mod blob;
 pub mod budget;
 pub mod error;
 pub mod event;
@@ -40,6 +42,7 @@ pub mod hypervisor;
 pub mod identity;
 pub mod ids;
 pub mod kernel;
+pub mod knowledge;
 pub mod memory;
 pub mod mode;
 pub mod network_isolation;

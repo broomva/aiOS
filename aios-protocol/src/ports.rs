@@ -418,3 +418,64 @@ mod trait_tests {
         fn _use_it(_: &dyn KernelPort) {}
     }
 }
+
+// ── Lago port family ─────────────────────────────────────────────────────────
+
+use crate::billing::{BillingPeriod, Invoice, TenantId, UsageRecord};
+use crate::blob::{BlobHash as BlobDtoHash, BlobMetadata};
+use crate::knowledge::{KnowledgeQuery, KnowledgeSearchResult, Note, NoteDraft, NoteEdge, NoteId};
+
+/// High-level knowledge index + wikilink graph port.
+///
+/// Implementors provide full-text search, note CRUD, and graph traversal over
+/// the knowledge index. `lago-knowledge` is the reference implementation;
+/// `life-kernel-facade` consumes this trait through `Arc<dyn KnowledgePort>`.
+#[async_trait]
+pub trait KnowledgePort: Send + Sync {
+    async fn search(&self, query: KnowledgeQuery) -> KernelResult<KnowledgeSearchResult>;
+    async fn get_note(&self, id: NoteId) -> KernelResult<Note>;
+    async fn upsert_note(&self, note: NoteDraft) -> KernelResult<Note>;
+    async fn graph_traverse(&self, from: NoteId, limit: u32) -> KernelResult<Vec<NoteEdge>>;
+}
+
+/// Content-addressed blob storage port.
+///
+/// Implementors provide immutable put/get over SHA-256–addressed payloads.
+/// `lago-store` is the reference implementation; `life-kernel-facade` consumes
+/// this trait through `Arc<dyn BlobStorePort>`.
+#[async_trait]
+pub trait BlobStorePort: Send + Sync {
+    async fn put(
+        &self,
+        payload: bytes::Bytes,
+        content_type: Option<String>,
+    ) -> KernelResult<BlobDtoHash>;
+    async fn get(&self, hash: BlobDtoHash) -> KernelResult<bytes::Bytes>;
+    async fn head(&self, hash: BlobDtoHash) -> KernelResult<BlobMetadata>;
+}
+
+/// Per-tenant usage metering and invoicing port.
+///
+/// Implementors record usage events and synthesize invoices. `life-kernel-facade`
+/// consumes this trait through `Arc<dyn BillingPort>`.
+#[async_trait]
+pub trait BillingPort: Send + Sync {
+    async fn record_usage(&self, usage: UsageRecord) -> KernelResult<()>;
+    async fn get_invoice(
+        &self,
+        tenant: TenantId,
+        period: BillingPeriod,
+    ) -> KernelResult<Invoice>;
+}
+
+#[cfg(test)]
+mod lago_ports_tests {
+    use super::*;
+
+    #[test]
+    fn _dyn_checks() {
+        fn _k(_p: &dyn KnowledgePort) {}
+        fn _b(_p: &dyn BlobStorePort) {}
+        fn _i(_p: &dyn BillingPort) {}
+    }
+}
