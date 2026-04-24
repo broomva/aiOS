@@ -525,3 +525,77 @@ mod homeostasis_port_tests {
         fn _dyn_safe(_p: &dyn HomeostasisPort) {}
     }
 }
+
+// ── FinancePort ───────────────────────────────────────────────────────────────
+
+use crate::budget::ResourceUsage;
+use crate::finance::{
+    PaymentAuthRequest, PaymentAuthorization, SettlementReceipt, TimeWindow, TransactionFilter,
+    TransactionRecord, UsageReport, WalletManifest,
+};
+
+/// High-level finance and payment port.
+///
+/// Implementors provide wallet inspection, payment authorization, on-chain
+/// settlement, transaction history, and spend reporting for a session.
+/// `haimad` is the reference implementation; `life-kernel-facade` consumes
+/// this trait through `Arc<dyn FinancePort>`.
+///
+/// ## Authorization lifecycle
+///
+/// 1. Caller calls [`authorize_payment`](FinancePort::authorize_payment) — haimad evaluates the
+///    request against the active `WalletPolicy` and returns a time-limited
+///    `PaymentAuthorization` (or an error if denied / requires human approval).
+/// 2. Caller calls [`settle`](FinancePort::settle) with the authorization and the actual
+///    resource usage — haimad submits the on-chain transaction and returns a
+///    `SettlementReceipt`.
+///
+/// Authorization IDs correlate authorization ↔ receipt for audit.
+#[async_trait]
+pub trait FinancePort: Send + Sync {
+    /// Fetch the current wallet manifest (address, balance, policy) for `owner`.
+    async fn get_wallet(&self, owner: SessionId) -> KernelResult<WalletManifest>;
+
+    /// Authorize an outbound payment from `owner`.
+    ///
+    /// Returns a time-limited authorization if the request passes policy.
+    /// Returns `KernelError::PolicyViolation` (or similar) if denied.
+    async fn authorize_payment(
+        &self,
+        req: PaymentAuthRequest,
+    ) -> KernelResult<PaymentAuthorization>;
+
+    /// Settle a pre-authorized payment and record actual resource usage.
+    ///
+    /// `usage` is forwarded to the budget gate and written to the audit log
+    /// so callers can correlate compute cost with financial cost.
+    async fn settle(
+        &self,
+        auth: PaymentAuthorization,
+        usage: ResourceUsage,
+    ) -> KernelResult<SettlementReceipt>;
+
+    /// List transactions for `owner` filtered by `filter`.
+    async fn list_transactions(
+        &self,
+        owner: SessionId,
+        filter: TransactionFilter,
+    ) -> KernelResult<Vec<TransactionRecord>>;
+
+    /// Return an aggregated spend report for `owner` over `window`.
+    async fn get_usage_report(
+        &self,
+        owner: SessionId,
+        window: TimeWindow,
+    ) -> KernelResult<UsageReport>;
+}
+
+#[cfg(test)]
+mod finance_port_tests {
+    use super::*;
+
+    #[test]
+    fn _assert_finance_port_dyn_safe() {
+        fn _dyn_safe(_p: &dyn FinancePort) {}
+    }
+}

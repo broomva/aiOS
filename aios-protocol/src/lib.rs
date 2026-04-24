@@ -17,6 +17,7 @@
 //! - [`sandbox`] — SandboxTier, SandboxLimits, NetworkPolicy
 //! - [`memory`] — SoulProfile, Observation, Provenance, MemoryScope
 //! - [`session`] — SessionManifest, BranchInfo, CheckpointManifest
+//! - [`finance`] — Finance DTOs (wallet, authorization, settlement, transaction history, usage)
 //! - [`payment`] — PaymentPort for agent financial operations (x402, MPP)
 //! - [`ports`] — Runtime boundary ports (event store, provider, tools, policy, approvals,
 //!   memory, KernelPort for high-level Tool-ABI dispatch)
@@ -38,6 +39,7 @@ pub mod blob;
 pub mod budget;
 pub mod error;
 pub mod event;
+pub mod finance;
 pub mod homeostasis;
 pub mod hypervisor;
 pub mod identity;
