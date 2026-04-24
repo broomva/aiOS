@@ -64,6 +64,57 @@ pub struct CheckpointManifest {
     pub note: String,
 }
 
+/// Request to create a new session.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CreateSessionRequest {
+    pub owner: String,
+    #[serde(default)]
+    pub policy: crate::policy::PolicySet,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<SessionId>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+/// Filter for listing sessions.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SessionFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Input for a single agent tick.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct TickInput {
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_tool: Option<crate::tool::ToolCall>,
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+}
+
+/// Output from a single agent tick.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct TickOutput {
+    pub session_id: SessionId,
+    pub iteration: u32,
+    pub stop_reason: crate::ports::ModelStopReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_answer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::event::TokenUsage>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

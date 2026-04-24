@@ -327,6 +327,38 @@ mod kernel_port {
 
 pub use kernel_port::KernelPort;
 
+use crate::session::{CreateSessionRequest, SessionFilter, SessionManifest, TickInput, TickOutput};
+
+/// High-level session lifecycle port.
+///
+/// Implementors provide create/get/list/tick/stream/close over the session tier.
+/// `arcand` is the reference implementation; `life-kernel-facade` consumes this
+/// trait through `Arc<dyn SessionPort>`.
+#[async_trait]
+pub trait SessionPort: Send + Sync {
+    async fn create(&self, req: CreateSessionRequest) -> KernelResult<SessionManifest>;
+    async fn get(&self, id: SessionId) -> KernelResult<SessionManifest>;
+    async fn list(&self, filter: SessionFilter) -> KernelResult<Vec<SessionManifest>>;
+    async fn tick(&self, id: SessionId, input: TickInput) -> KernelResult<TickOutput>;
+    async fn stream_events(
+        &self,
+        id: SessionId,
+        branch: BranchId,
+        after_sequence: u64,
+    ) -> KernelResult<EventRecordStream>;
+    async fn close(&self, id: SessionId, reason: String) -> KernelResult<()>;
+}
+
+#[cfg(test)]
+mod session_port_tests {
+    use super::*;
+
+    #[test]
+    fn _assert_session_port_dyn_safe() {
+        fn _dyn_safe(_p: &dyn SessionPort) {}
+    }
+}
+
 #[cfg(test)]
 mod trait_tests {
     use super::*;
