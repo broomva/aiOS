@@ -479,3 +479,49 @@ mod lago_ports_tests {
         fn _i(_p: &dyn BillingPort) {}
     }
 }
+
+// ── HomeostasisPort ───────────────────────────────────────────────────────────
+
+use crate::homeostasis::{
+    BudgetStateDto, EconomicMode, HomeostaticProjectionDto, HomeostaticStateDto,
+};
+
+/// High-level homeostasis query port.
+///
+/// Implementors provide read-access to live homeostatic state and budget
+/// snapshots for a session. `autonomicd` is the reference implementation;
+/// `life-kernel-facade` consumes this trait through
+/// `Arc<dyn HomeostasisPort>`.
+///
+/// Streaming projections are returned as a [`BoxStream`] so callers can
+/// consume them incrementally without holding a large in-memory buffer.
+#[async_trait]
+pub trait HomeostasisPort: Send + Sync {
+    /// Return the current three-pillar homeostatic snapshot for `session`.
+    async fn get_state(&self, session: SessionId) -> KernelResult<HomeostaticStateDto>;
+
+    /// Return the budget snapshot for the economic pillar of `session`.
+    async fn get_budget(&self, session: SessionId) -> KernelResult<BudgetStateDto>;
+
+    /// Return the current economic operating mode for `session`.
+    async fn get_economic_mode(&self, session: SessionId) -> KernelResult<EconomicMode>;
+
+    /// Open a stream of projected future states for `session`.
+    ///
+    /// The stream is `'static` so it can be held across `.await` points
+    /// without a borrow on `self`.
+    async fn stream_projections(
+        &self,
+        session: SessionId,
+    ) -> KernelResult<BoxStream<'static, KernelResult<HomeostaticProjectionDto>>>;
+}
+
+#[cfg(test)]
+mod homeostasis_port_tests {
+    use super::*;
+
+    #[test]
+    fn _assert_homeostasis_port_dyn_safe() {
+        fn _dyn_safe(_p: &dyn HomeostasisPort) {}
+    }
+}

@@ -38,6 +38,7 @@ pub mod blob;
 pub mod budget;
 pub mod error;
 pub mod event;
+pub mod homeostasis;
 pub mod hypervisor;
 pub mod identity;
 pub mod ids;
