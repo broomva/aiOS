@@ -38,6 +38,7 @@ pub mod billing;
 pub mod blob;
 pub mod budget;
 pub mod error;
+pub mod evaluation;
 pub mod event;
 pub mod finance;
 pub mod homeostasis;

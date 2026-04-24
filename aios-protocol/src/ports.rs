@@ -600,6 +600,34 @@ mod finance_port_tests {
     }
 }
 
+// ── EvaluationPort ───────────────────────────────────────────────────────────
+
+use crate::evaluation::{
+    EvaluationReport, EvaluationRequest, HeuristicScore, HeuristicScoreRequest, JudgementRequest,
+    JudgementVerdict,
+};
+
+/// High-level metacognitive evaluation port.
+///
+/// Implementors provide rubric-based evaluation, heuristic scoring, and
+/// comparative judgement. `nousd` is the reference implementation;
+/// `life-kernel-facade` consumes this trait through `Arc<dyn EvaluationPort>`.
+#[async_trait]
+pub trait EvaluationPort: Send + Sync {
+    async fn evaluate(&self, req: EvaluationRequest) -> KernelResult<EvaluationReport>;
+    async fn heuristic_score(&self, req: HeuristicScoreRequest) -> KernelResult<HeuristicScore>;
+    async fn judge(&self, req: JudgementRequest) -> KernelResult<JudgementVerdict>;
+}
+
+#[cfg(test)]
+mod evaluation_port_tests {
+    use super::*;
+    #[test]
+    fn _assert_evaluation_port_dyn_safe() {
+        fn _dyn_safe(_p: &dyn EvaluationPort) {}
+    }
+}
+
 // ── WorldPort ─────────────────────────────────────────────────────────────────
 
 use crate::world::{WorldEvent, WorldId, WorldMutation, WorldSnapshot, WorldVersion};
