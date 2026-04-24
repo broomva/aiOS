@@ -628,6 +628,35 @@ mod evaluation_port_tests {
     }
 }
 
+// ── RelayPort ─────────────────────────────────────────────────────────────────
+
+use crate::relay::{RelayFrame, RelayOpenRequest, RelaySession, RelayToken};
+
+/// Remote session relay port — v0.2 reserved stub.
+///
+/// Implementors proxy web-based remote agent sessions from life-relayd.
+/// Facade implementations return `KernelError::Unimplemented` until v0.2
+/// lights the proxies up (Phase 4).
+#[async_trait]
+pub trait RelayPort: Send + Sync {
+    async fn open(&self, req: RelayOpenRequest) -> KernelResult<RelaySession>;
+    async fn send(&self, session: RelayToken, frame: RelayFrame) -> KernelResult<()>;
+    async fn subscribe(
+        &self,
+        session: RelayToken,
+    ) -> KernelResult<BoxStream<'static, KernelResult<RelayFrame>>>;
+    async fn close(&self, session: RelayToken) -> KernelResult<()>;
+}
+
+#[cfg(test)]
+mod relay_port_tests {
+    use super::*;
+    #[test]
+    fn _assert_relay_port_dyn_safe() {
+        fn _dyn_safe(_p: &dyn RelayPort) {}
+    }
+}
+
 // ── WorldPort ─────────────────────────────────────────────────────────────────
 
 use crate::world::{WorldEvent, WorldId, WorldMutation, WorldSnapshot, WorldVersion};

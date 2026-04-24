@@ -54,6 +54,7 @@ pub mod payment;
 pub mod policy;
 pub mod ports;
 pub mod rcs;
+pub mod relay;
 pub mod sandbox;
 pub mod session;
 pub mod state;

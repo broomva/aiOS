@@ -9,6 +9,7 @@ description = "Canonical Agent OS protocol — shared types, event taxonomy, and
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 bitflags.workspace = true
 bytes.workspace = true
 chrono.workspace = true
