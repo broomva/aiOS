@@ -645,9 +645,10 @@ pub enum EventKind {
 
     // ── Kernel events (kernel.*) ──
     //
-    // First-class variants emitted by lifed / any `KernelPort` implementation.
+    // First-class variants emitted by soma / any `KernelPort` implementation.
     // Each wraps a payload struct defined at the bottom of this file. See the
-    // 2026-04-23 lifed kernel daemon design spec §3.2 for the typing rationale
+    // 2026-04-23 lifed kernel daemon design spec §3.2 (renamed `soma` 2026-04-25; spec C M0)
+    //   for the typing rationale
     // (D4: "first-class, not Custom") and payload definitions.
     /// A VM was created on a hypervisor backend.
     KernelVmCreated(KernelVmCreated),

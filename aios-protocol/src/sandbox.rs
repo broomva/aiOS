@@ -29,7 +29,7 @@ pub enum SandboxTier {
     /// Hardware-isolated micro-VM (e.g. Cloud Hypervisor, Firecracker).
     ///
     /// The strongest tier on the scale — separate kernel, separate address
-    /// space, independent resource accounting. Used by `lifed` as the
+    /// space, independent resource accounting. Used by `soma` as the
     /// default tier for agent VMs emitted by the kernel daemon.
     ///
     /// Serialized as `"micro_vm"` (explicit `rename` override — serde's

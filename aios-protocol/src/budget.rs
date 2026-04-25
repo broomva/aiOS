@@ -98,7 +98,7 @@ pub enum BudgetDecision {
 /// [`crate::ports::KernelPort`] dispatch and fork.
 ///
 /// The gate is advisory from the caller's perspective but authoritative from
-/// the kernel's: `lifed` will translate a [`BudgetDecision::Deny`] into
+/// the kernel's: `soma` will translate a [`BudgetDecision::Deny`] into
 /// [`crate::kernel::KernelError::GateDenied`] with
 /// [`crate::kernel::GateKind::Budget`], and
 /// [`BudgetDecision::RequireApproval`] into an approval-pending stall.

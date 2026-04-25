@@ -238,10 +238,10 @@ mod kernel_port {
     /// High-level Tool-ABI dispatch into an isolated VM.
     ///
     /// This is the trait callers depend on — `arcand` today, Life Runtime
-    /// library in Spec B tomorrow — and the canonical surface `lifed`
+    /// library in Spec B tomorrow — and the canonical surface `soma`
     /// implements. Everything lower-level (raw VM lifecycle, shell exec,
     /// filesystem) sits behind [`crate::hypervisor::HypervisorBackend`] and
-    /// is orchestrated by the `lifed` implementation of this trait.
+    /// is orchestrated by the `soma` implementation of this trait.
     ///
     /// ## Shared-ref only
     ///
