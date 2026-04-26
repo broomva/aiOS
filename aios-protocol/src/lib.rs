@@ -33,6 +33,9 @@
 //!   the BackendError / BackendCapabilitySet surface implemented by `arcan-provider-*`
 //! - [`network_isolation`] — EgressTarget, EgressProtocol, NetworkIsolationPort
 //!   (egress metering + per-VM enforcement)
+//! - [`proto_bridge`] — `From`/`Into` impls between Layer-1 hand-written
+//!   types and the Layer-2 generated types in `aios-proto::aios::v1::*`
+//!   (M3 / BRO-928). Currently covers the 5 canonical identifier types.
 
 pub mod billing;
 pub mod blob;
@@ -53,6 +56,7 @@ pub mod network_isolation;
 pub mod payment;
 pub mod policy;
 pub mod ports;
+pub mod proto_bridge;
 pub mod rcs;
 pub mod relay;
 pub mod sandbox;
