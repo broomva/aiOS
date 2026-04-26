@@ -1,0 +1,20 @@
+[package]
+name = "aios-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Canonical aios.v1 proto types — generated from core/life/proto/aios/v1/*.proto"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+tonic.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+
+[lints]
+workspace = true
