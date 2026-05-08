@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use blake3::Hasher;
 use chrono::Utc;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::fs;
@@ -47,6 +47,50 @@ pub struct TickInput {
     pub system_prompt: Option<String>,
     /// Tool whitelist from active skill. When set, only these tools are sent to the LLM.
     pub allowed_tools: Option<Vec<String>>,
+    /// What kind of body runs in this tick — direct (one model call, the
+    /// existing default) or workflow (an `ergon::Workflow` runs as the
+    /// tick body via an externally-registered handler).
+    ///
+    /// `TickKind::default() == TickKind::Direct` so call sites that
+    /// don't care about workflow dispatch can pass
+    /// `kind: TickKind::Direct` to preserve prior behaviour.
+    ///
+    /// See `core/life/docs/superpowers/specs/2026-05-08-bro-1001-ergon-tick-body.md`
+    /// and `core/life/docs/architecture/agent-harness.md` (§ "Where evaluators live").
+    pub kind: TickKind,
+}
+
+/// What body runs inside a single kernel tick.
+///
+/// The kernel itself only knows how to run `Direct` ticks (one model
+/// call via `ModelProviderPort` plus optional tool dispatch). Other
+/// variants are dispatched through a `WorkflowTickHandler` that the
+/// host runtime registers at construction time (typically arcand wires
+/// `arcan-ergon` to handle [`Self::Workflow`]).
+///
+/// `#[non_exhaustive]` — future variants like `VerifyWorkflow` or
+/// `RecoverWorkflow` may land without breaking existing call sites.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TickKind {
+    /// Existing path: kernel calls `ModelProviderPort.complete(...)`
+    /// once and optionally dispatches a single tool call. This is the
+    /// default for backward compatibility.
+    #[default]
+    Direct,
+    /// New path: kernel hands off to a registered workflow handler
+    /// that runs an entire bounded multi-turn operation as the tick
+    /// body and returns a typed JSON output. See BRO-1001's spec.
+    Workflow {
+        /// Workflow name (e.g. `"bookkeeping.promotion-judge"`).
+        /// Resolved by the workflow handler against its registry.
+        name: String,
+        /// Typed input for the workflow, serialized to JSON. The
+        /// workflow's `ergon::Workflow::Input` must `serde::Deserialize`
+        /// from this value.
+        input: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +316,65 @@ struct BranchRuntimeState {
     merged_into: Option<BranchId>,
 }
 
+/// Invocation passed to a [`WorkflowTickDispatcher`] when the kernel
+/// receives a tick whose `kind == TickKind::Workflow`.
+///
+/// Carries everything the dispatcher needs to assemble an
+/// `ergon::StepCtx` against the kernel's currently configured ports
+/// without binding aios-runtime to ergon's types.
+///
+/// Lifetimes: borrowed from the kernel's tick frame, so the dispatcher
+/// must finish before [`KernelRuntime::tick_on_branch`] returns.
+pub struct WorkflowTickInvocation<'a> {
+    pub session_id: &'a SessionId,
+    pub branch_id: &'a BranchId,
+    pub run_id: &'a RunId,
+    pub manifest: &'a SessionManifest,
+    pub state: &'a AgentStateVector,
+    pub mode: OperatingMode,
+    pub workflow_name: &'a str,
+    pub workflow_input: &'a Value,
+    pub objective: &'a str,
+    pub system_prompt: Option<&'a str>,
+    pub allowed_tools: Option<&'a [String]>,
+    pub provider: &'a Arc<dyn ModelProviderPort>,
+    pub tool_harness: &'a Arc<dyn ToolHarnessPort>,
+    pub policy_gate: &'a Arc<dyn PolicyGatePort>,
+    pub event_store: &'a Arc<dyn EventStorePort>,
+}
+
+/// Result of running an `ergon::Workflow` as the body of one kernel
+/// tick. The dispatcher already streams `StreamEvent`s and persists
+/// per-step events through whatever sinks/hooks it wired; this struct
+/// only carries back what the kernel needs to finalize the tick.
+#[derive(Debug, Clone)]
+pub struct WorkflowTickOutcome {
+    /// Number of additional `EventRecord`s the dispatcher emitted
+    /// during the workflow body. The kernel adds this to its own
+    /// emission count for the returned [`TickOutput`].
+    pub events_emitted: u64,
+    /// Workflow's typed JSON output. The host (e.g. arcand) decides
+    /// what to do with it — typically it's appended to the journal as
+    /// a `Custom` event keyed by workflow name.
+    pub output: Value,
+    /// Optional next operating mode the workflow body suggests. When
+    /// `None`, the kernel keeps its current mode estimation logic.
+    pub next_mode: Option<OperatingMode>,
+}
+
+/// Kernel-side hand-off point for non-direct tick bodies. Implemented
+/// by `arcan-ergon` (and any future workflow runtime) and registered
+/// on the [`KernelRuntime`] at construction time. See
+/// `core/life/docs/superpowers/specs/2026-05-08-bro-1001-ergon-tick-body.md`.
+#[async_trait]
+pub trait WorkflowTickDispatcher: Send + Sync {
+    /// Run a workflow as the body of a single tick. Errors propagate
+    /// up through `tick_on_branch` exactly like a direct-tick error
+    /// would.
+    async fn dispatch(&self, invocation: WorkflowTickInvocation<'_>)
+    -> Result<WorkflowTickOutcome>;
+}
+
 #[derive(Clone)]
 pub struct KernelRuntime {
     config: RuntimeConfig,
@@ -281,6 +384,7 @@ pub struct KernelRuntime {
     approvals: Arc<dyn ApprovalPort>,
     policy_gate: Arc<dyn PolicyGatePort>,
     turn_middlewares: Vec<Arc<dyn TurnMiddleware>>,
+    workflow_dispatcher: Option<Arc<dyn WorkflowTickDispatcher>>,
     stream: broadcast::Sender<EventRecord>,
     sessions: Arc<Mutex<HashMap<String, SessionRuntimeState>>>,
 }
@@ -323,9 +427,26 @@ impl KernelRuntime {
             approvals,
             policy_gate,
             turn_middlewares,
+            workflow_dispatcher: None,
             stream,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Register a dispatcher for [`TickKind::Workflow`] ticks. Builder
+    /// style so existing call sites that build a [`KernelRuntime`] via
+    /// [`Self::new`] / [`Self::with_turn_middlewares`] keep working
+    /// with the default (no dispatcher → `Workflow` ticks fail with
+    /// a clear error).
+    pub fn with_workflow_dispatcher(mut self, dispatcher: Arc<dyn WorkflowTickDispatcher>) -> Self {
+        self.workflow_dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// Returns whether a [`WorkflowTickDispatcher`] is currently
+    /// registered. Useful for host-side wiring assertions and tests.
+    pub fn has_workflow_dispatcher(&self) -> bool {
+        self.workflow_dispatcher.is_some()
     }
 
     #[instrument(skip(self, owner, policy, model_routing))]
@@ -576,6 +697,141 @@ impl KernelRuntime {
         }
 
         let run_id = RunId::default();
+
+        // Workflow tick body (BRO-1001): hand off the entire run to a
+        // registered dispatcher (typically arcan-ergon). The kernel
+        // still owns Perceive/Deliberate/StateEstimated above and
+        // Commit/Reflect below; the workflow body fills the middle.
+        if let TickKind::Workflow {
+            name: workflow_name,
+            input: workflow_input,
+        } = &input.kind
+        {
+            let dispatcher = self.workflow_dispatcher.as_ref().with_context(|| {
+                format!(
+                    "tick requested workflow body `{workflow_name}` but no \
+                     WorkflowTickDispatcher is registered on this KernelRuntime; \
+                     wire one via `KernelRuntime::with_workflow_dispatcher` (e.g. \
+                     arcan-ergon's adapter)"
+                )
+            })?;
+
+            self.append_event(
+                session_id,
+                branch_id,
+                EventKind::RunStarted {
+                    provider: format!("workflow:{workflow_name}"),
+                    max_iterations: 1,
+                },
+            )
+            .await?;
+            emitted += 1;
+            self.append_event(session_id, branch_id, EventKind::StepStarted { index: 0 })
+                .await?;
+            emitted += 1;
+
+            let allowed_tools_slice = input.allowed_tools.as_deref();
+            let invocation = WorkflowTickInvocation {
+                session_id,
+                branch_id,
+                run_id: &run_id,
+                manifest,
+                state,
+                mode,
+                workflow_name: workflow_name.as_str(),
+                workflow_input,
+                objective: input.objective.as_str(),
+                system_prompt: input.system_prompt.as_deref(),
+                allowed_tools: allowed_tools_slice,
+                provider: &self.provider,
+                tool_harness: &self.tool_harness,
+                policy_gate: &self.policy_gate,
+                event_store: &self.event_store,
+            };
+
+            // Mirror the Direct path's terminal lifecycle: on success
+            // emit Custom(workflow_output) + StepFinished + RunFinished;
+            // on error emit RunErrored, update state.error_streak /
+            // uncertainty / error_budget, then run the same
+            // Commit/Reflect/Sleep finalize path so the tick produces
+            // a coherent journal regardless of which body shape ran.
+            match dispatcher.dispatch(invocation).await {
+                Ok(outcome) => {
+                    emitted += outcome.events_emitted;
+                    if let Some(next_mode) = outcome.next_mode {
+                        mode = next_mode;
+                    }
+
+                    self.append_event(
+                        session_id,
+                        branch_id,
+                        EventKind::Custom {
+                            event_type: "ergon.workflow_output".to_owned(),
+                            data: serde_json::json!({
+                                "workflow": workflow_name,
+                                "output": outcome.output,
+                            }),
+                        },
+                    )
+                    .await?;
+                    emitted += 1;
+
+                    self.append_event(
+                        session_id,
+                        branch_id,
+                        EventKind::StepFinished {
+                            index: 0,
+                            stop_reason: "workflow_completed".to_owned(),
+                            directive_count: 1,
+                        },
+                    )
+                    .await?;
+                    emitted += 1;
+                    self.append_event(
+                        session_id,
+                        branch_id,
+                        EventKind::RunFinished {
+                            reason: "workflow_completed".to_owned(),
+                            total_iterations: 1,
+                            final_answer: None,
+                            usage: None,
+                        },
+                    )
+                    .await?;
+                    emitted += 1;
+                }
+                Err(error) => {
+                    mode = OperatingMode::Recover;
+                    state.error_streak += 1;
+                    state.uncertainty = (state.uncertainty + 0.15).min(1.0);
+                    state.budget.error_budget_remaining =
+                        state.budget.error_budget_remaining.saturating_sub(1);
+                    self.append_event(
+                        session_id,
+                        branch_id,
+                        EventKind::RunErrored {
+                            error: format!("workflow `{workflow_name}`: {error:#}"),
+                        },
+                    )
+                    .await?;
+                    emitted += 1;
+                }
+            }
+
+            emitted += self
+                .emit_phase(session_id, branch_id, LoopPhase::Commit)
+                .await?;
+            emitted += self
+                .finalize_tick(session_id, branch_id, manifest, state, &mode)
+                .await?;
+            ctx.mode = mode;
+            let _ = previous_mode; // suppress unused warning on this branch
+            let _ = (&mut _tool_calls_this_tick, &mut _file_mutations_this_tick);
+            return self
+                .current_tick_output(session_id, branch_id, mode, (*state).clone(), emitted)
+                .await;
+        }
+
         self.append_event(
             session_id,
             branch_id,

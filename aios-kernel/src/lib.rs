@@ -9,7 +9,7 @@ use aios_protocol::{
     ModelStopReason, PolicyGatePort, PolicySet, SessionId, SessionManifest, TokenUsage, ToolCall,
     ToolHarnessPort,
 };
-use aios_runtime::{KernelRuntime, RuntimeConfig, TickInput, TickOutput, TurnMiddleware};
+use aios_runtime::{KernelRuntime, RuntimeConfig, TickInput, TickKind, TickOutput, TurnMiddleware};
 use aios_sandbox::LocalSandboxRunner;
 use aios_tools::{ToolDispatcher, ToolRegistry};
 use anyhow::Result;
@@ -172,6 +172,7 @@ impl AiosKernel {
                     proposed_tool,
                     system_prompt: None,
                     allowed_tools: None,
+                    kind: TickKind::Direct,
                 },
             )
             .await
