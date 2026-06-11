@@ -117,6 +117,6 @@ pub use state::{
     PatchOp, ProvenanceRef, StatePatch, VersionedCanonicalState,
 };
 pub use tool::{
-    Tool, ToolAnnotations, ToolCall, ToolContent, ToolContext, ToolDefinition, ToolError,
-    ToolOutcome, ToolRegistry, ToolResult,
+    ClientToolDefinition, ClientToolDefinitionError, Tool, ToolAnnotations, ToolCall, ToolContent,
+    ToolContext, ToolDefinition, ToolError, ToolOutcome, ToolRegistry, ToolResult,
 };

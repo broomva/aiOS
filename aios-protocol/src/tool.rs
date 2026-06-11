@@ -110,6 +110,105 @@ pub struct ToolDefinition {
     pub timeout_secs: Option<u32>,
 }
 
+// ── Client-supplied tool definitions ──────────────────────────────────
+
+/// A tool declared by the chat *client* rather than the kernel's own
+/// governed registry.
+///
+/// These arrive over the substrate wire (`DispatchMessageReq.tool_definitions`,
+/// one JSON object per entry in the AI-SDK / OpenAI function shape
+/// `{"name", "description", "parameters"}`). They live in a different
+/// trust domain from registry tools: the kernel never executes them —
+/// it surfaces them to the model and, when the model proposes one,
+/// hands the call back to the client as a `TOOL_CALL_PENDING` frame
+/// (category `"client"`). The client executes the tool and replays the
+/// result as conversation context on the next dispatch.
+///
+/// Because they are never policy-gated or harness-executed, they carry
+/// no [`Capability`] set — only the model-visible surface (name,
+/// description, JSON-Schema parameters passed through verbatim).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientToolDefinition {
+    /// Unique tool name as the model will reference it.
+    pub name: String,
+    /// Human-readable description of what the tool does.
+    #[serde(default)]
+    pub description: String,
+    /// JSON Schema describing the tool's input parameters. Passed
+    /// through to the provider verbatim (OpenAI `function.parameters`).
+    #[serde(default)]
+    pub parameters: serde_json::Value,
+}
+
+impl ClientToolDefinition {
+    /// Parse one wire entry (a single JSON object in the AI-SDK /
+    /// OpenAI function shape `{"name", "description", "parameters"}`).
+    ///
+    /// Returns an error when the bytes are not valid JSON, are not a
+    /// JSON object, carry an empty/missing `name`, carry a non-string
+    /// `description`, or carry a non-object `parameters`. Absent
+    /// `description`/`parameters` stay permissive (empty string / Null)
+    /// — absence is well-formed, a wrong TYPE is malformed. Callers at
+    /// the trust boundary (the substrate dispatch handler) treat these
+    /// errors as "skip this entry" rather than failing the whole
+    /// dispatch.
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, ClientToolDefinitionError> {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(ClientToolDefinitionError::Json)?;
+        Self::from_value(value)
+    }
+
+    /// Parse one already-deserialized JSON value. Shares the validation
+    /// rules with [`Self::from_wire_bytes`].
+    pub fn from_value(value: serde_json::Value) -> Result<Self, ClientToolDefinitionError> {
+        let obj = value
+            .as_object()
+            .ok_or(ClientToolDefinitionError::NotAnObject)?;
+        let name = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .filter(|n| !n.is_empty())
+            .ok_or(ClientToolDefinitionError::MissingName)?;
+        let description = match obj.get("description") {
+            Some(v) => v
+                .as_str()
+                .map(str::to_owned)
+                .ok_or(ClientToolDefinitionError::InvalidDescriptionType)?,
+            None => String::new(),
+        };
+        let parameters = match obj.get("parameters") {
+            Some(v) if v.is_object() => v.clone(),
+            Some(_) => return Err(ClientToolDefinitionError::InvalidParametersType),
+            None => serde_json::Value::Null,
+        };
+        Ok(Self {
+            name,
+            description,
+            parameters,
+        })
+    }
+}
+
+/// Reasons a client tool-definition wire entry was rejected.
+///
+/// `thiserror` per the library convention; callers downgrade these to
+/// `warn!`-and-skip at the dispatch boundary so a malformed entry never
+/// aborts an otherwise-valid turn.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientToolDefinitionError {
+    #[error("client tool definition is not valid JSON: {0}")]
+    Json(serde_json::Error),
+    #[error("client tool definition is not a JSON object")]
+    NotAnObject,
+    #[error("client tool definition is missing a non-empty `name`")]
+    MissingName,
+    #[error("client tool definition has a non-string `description`")]
+    InvalidDescriptionType,
+    #[error("client tool definition has a non-object `parameters`")]
+    InvalidParametersType,
+}
+
 // ── Typed content blocks ──────────────────────────────────────────────
 
 /// Typed content block in a tool result (MCP-compatible).
@@ -461,6 +560,89 @@ mod tests {
         let back: ToolDefinition = serde_json::from_str(&json_str).unwrap();
         assert_eq!(def, back);
         assert!(json_str.contains("\"category\":\"filesystem\""));
+    }
+
+    // ── ClientToolDefinition tests ──
+
+    #[test]
+    fn client_tool_def_from_wire_bytes_full_shape() {
+        let bytes = br#"{
+            "name": "get_weather",
+            "description": "Look up the weather",
+            "parameters": {
+                "type": "object",
+                "properties": { "city": { "type": "string" } },
+                "required": ["city"]
+            }
+        }"#;
+        let def = ClientToolDefinition::from_wire_bytes(bytes).expect("valid client tool");
+        assert_eq!(def.name, "get_weather");
+        assert_eq!(def.description, "Look up the weather");
+        // parameters passed through verbatim.
+        assert_eq!(def.parameters["properties"]["city"]["type"], "string");
+        assert_eq!(def.parameters["required"][0], "city");
+    }
+
+    #[test]
+    fn client_tool_def_missing_description_and_parameters_defaults() {
+        let bytes = br#"{ "name": "ping" }"#;
+        let def = ClientToolDefinition::from_wire_bytes(bytes).expect("name-only is valid");
+        assert_eq!(def.name, "ping");
+        assert_eq!(def.description, "");
+        assert_eq!(def.parameters, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn client_tool_def_rejects_invalid_json() {
+        let err = ClientToolDefinition::from_wire_bytes(b"{not json").unwrap_err();
+        assert!(matches!(err, ClientToolDefinitionError::Json(_)));
+    }
+
+    #[test]
+    fn client_tool_def_rejects_non_object() {
+        let err = ClientToolDefinition::from_wire_bytes(b"[1, 2, 3]").unwrap_err();
+        assert!(matches!(err, ClientToolDefinitionError::NotAnObject));
+    }
+
+    #[test]
+    fn client_tool_def_rejects_wrong_field_types() {
+        // Present-but-mistyped fields are malformed (warn+skip at the
+        // boundary); absence stays permissive — covered by
+        // client_tool_def_missing_description_and_parameters_defaults.
+        let desc = ClientToolDefinition::from_wire_bytes(br#"{"name": "t", "description": 7}"#)
+            .unwrap_err();
+        assert!(matches!(
+            desc,
+            ClientToolDefinitionError::InvalidDescriptionType
+        ));
+        let params =
+            ClientToolDefinition::from_wire_bytes(br#"{"name": "t", "parameters": "str"}"#)
+                .unwrap_err();
+        assert!(matches!(
+            params,
+            ClientToolDefinitionError::InvalidParametersType
+        ));
+    }
+
+    #[test]
+    fn client_tool_def_rejects_missing_or_empty_name() {
+        let missing =
+            ClientToolDefinition::from_wire_bytes(br#"{"description": "x"}"#).unwrap_err();
+        assert!(matches!(missing, ClientToolDefinitionError::MissingName));
+        let empty = ClientToolDefinition::from_wire_bytes(br#"{"name": ""}"#).unwrap_err();
+        assert!(matches!(empty, ClientToolDefinitionError::MissingName));
+    }
+
+    #[test]
+    fn client_tool_def_serde_roundtrip() {
+        let def = ClientToolDefinition {
+            name: "search".into(),
+            description: "Search the web".into(),
+            parameters: json!({"type": "object"}),
+        };
+        let json_str = serde_json::to_string(&def).unwrap();
+        let back: ClientToolDefinition = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(def, back);
     }
 
     // ── ToolContent tests ──

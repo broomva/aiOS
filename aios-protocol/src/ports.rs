@@ -12,7 +12,7 @@ use crate::error::KernelResult;
 use crate::event::{EventRecord, TokenUsage};
 use crate::ids::{ApprovalId, BranchId, RunId, SessionId, ToolRunId};
 use crate::policy::Capability;
-use crate::tool::{ToolCall, ToolOutcome};
+use crate::tool::{ClientToolDefinition, ToolCall, ToolOutcome};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::stream::BoxStream;
@@ -40,6 +40,13 @@ pub struct ModelCompletionRequest {
     /// Built by the runtime from the event journal before each provider call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conversation_history: Vec<ConversationTurn>,
+    /// Client-declared tools (a different trust domain from the kernel
+    /// registry). The provider adapter appends these to the
+    /// model-visible tools array; the kernel never executes them.
+    /// Registry tools shadow client tools of the same name (resolved
+    /// upstream, before this request is built).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_tools: Vec<ClientToolDefinition>,
 }
 
 /// A single turn in the conversation history (user message + assistant response).

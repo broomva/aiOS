@@ -25,5 +25,8 @@ opentelemetry = "0.29"
 uuid.workspace = true
 life-vigil.workspace = true
 
+[dev-dependencies]
+futures-util.workspace = true
+
 [lints]
 workspace = true

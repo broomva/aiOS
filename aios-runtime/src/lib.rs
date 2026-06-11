@@ -47,6 +47,13 @@ pub struct TickInput {
     pub system_prompt: Option<String>,
     /// Tool whitelist from active skill. When set, only these tools are sent to the LLM.
     pub allowed_tools: Option<Vec<String>>,
+    /// Client-declared tools (a different trust domain from the kernel
+    /// registry). Surfaced to the model alongside registry tools; when
+    /// the model proposes one, the kernel emits a `ToolCallRequested`
+    /// with category `"client"` and hands the call back to the caller
+    /// instead of policy-gating or executing it. Empty for the common
+    /// case. See `aios_protocol::ClientToolDefinition`.
+    pub client_tools: Vec<aios_protocol::ClientToolDefinition>,
     /// What kind of body runs in this tick — direct (one model call, the
     /// existing default) or workflow (an `ergon::Workflow` runs as the
     /// tick body via an externally-registered handler).
@@ -387,6 +394,16 @@ pub struct KernelRuntime {
     workflow_dispatcher: Option<Arc<dyn WorkflowTickDispatcher>>,
     stream: broadcast::Sender<EventRecord>,
     sessions: Arc<Mutex<HashMap<String, SessionRuntimeState>>>,
+    /// Names of the kernel's own governed (harness/registry) tools.
+    ///
+    /// Used only to enforce the registry-wins collision rule when a
+    /// `TickInput.client_tools` entry shares a name with a registry
+    /// tool: such a name is NOT treated as a client handoff. Empty by
+    /// default — when empty, every `client_tools` name is a potential
+    /// client handoff and collision pruning is expected to have already
+    /// happened upstream (the substrate dispatch handler does this).
+    /// Production wires the real set via [`Self::with_registry_tool_names`].
+    registry_tool_names: std::collections::HashSet<String>,
 }
 
 impl KernelRuntime {
@@ -430,7 +447,31 @@ impl KernelRuntime {
             workflow_dispatcher: None,
             stream,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            registry_tool_names: std::collections::HashSet::new(),
         }
+    }
+
+    /// Declare the names of the kernel's own governed tools so the
+    /// runtime can enforce registry-wins for client-tool collisions.
+    ///
+    /// Builder style (additive across calls). When a
+    /// `TickInput.client_tools` entry names a tool that is also in this
+    /// set, the kernel executes the registry tool through the harness
+    /// instead of handing the call back to the client. Hosts that
+    /// surface `client_tools` MUST wire this (see `arcan serve`) — with
+    /// an empty set, every client-declared name becomes a handoff and a
+    /// malicious client could silently divert registry-tool calls to
+    /// itself (no kernel execution, but also no error). Upstream
+    /// collision pruning (the substrate dispatch handler) is the first
+    /// line of defence; this is the second.
+    pub fn with_registry_tool_names<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.registry_tool_names
+            .extend(names.into_iter().map(Into::into));
+        self
     }
 
     /// Register a dispatcher for [`TickKind::Workflow`] ticks. Builder
@@ -873,6 +914,7 @@ impl KernelRuntime {
                     system_prompt: input.system_prompt.clone(),
                     allowed_tools: input.allowed_tools.clone(),
                     conversation_history,
+                    client_tools: input.client_tools.clone(),
                 })
                 .await
                 .map_err(|error| anyhow::anyhow!(error.to_string()))
@@ -892,6 +934,42 @@ impl KernelRuntime {
                     .await?;
                     emitted += 1;
                 }
+
+                // Client-declared tool names for this tick, with the
+                // registry-wins collision rule applied: a name that is
+                // also a kernel registry tool is NOT a client handoff
+                // (the registry tool executes through the harness as
+                // usual). A collision is warned — the kernel keeps the
+                // governed registry tool and drops the client shadow, so
+                // operators can see a client tried to redeclare a name
+                // the kernel owns. When `registry_tool_names` is empty
+                // (the default), collision pruning is assumed to have
+                // already happened upstream, so every declared name is
+                // eligible.
+                let client_tool_names: std::collections::HashSet<&str> = input
+                    .client_tools
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .filter(|name| {
+                        if self.registry_tool_names.contains(*name) {
+                            warn!(
+                                tool_name = %name,
+                                "client tool name collides with a kernel registry tool; \
+                                 registry wins — dropping the client shadow"
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .collect();
+                // Set when the model proposed at least one client tool in
+                // this completion. Drives the end-of-turn handoff: the
+                // tick must finish cleanly (mode ≠ Execute so the
+                // dispatch loop breaks, ≠ Recover since it is not an
+                // error). The continuation arrives as a new dispatch with
+                // the client's tool result replayed into the history.
+                let mut client_tool_proposed = false;
 
                 let mut directive_count = 0_usize;
                 for directive in completion.directives {
@@ -921,6 +999,39 @@ impl KernelRuntime {
                             emitted += 1;
                         }
                         ModelDirective::ToolCall { call } => {
+                            // Client-tool handoff: a call whose name is a
+                            // client-declared tool (and not a registry
+                            // tool — collisions were pruned above) is not
+                            // ours to gate or execute. Emit a
+                            // `ToolCallRequested` tagged `category:
+                            // "client"` (the wire maps it to
+                            // TOOL_CALL_PENDING) and hand the call back to
+                            // the caller. No guard, no policy gate, no
+                            // harness — the chat client owns this trust
+                            // domain and executes the tool, then replays
+                            // the result as conversation history on the
+                            // next dispatch.
+                            if client_tool_names.contains(call.tool_name.as_str()) {
+                                self.append_event(
+                                    session_id,
+                                    branch_id,
+                                    EventKind::ToolCallRequested {
+                                        call_id: call.call_id.clone(),
+                                        tool_name: call.tool_name.clone(),
+                                        arguments: call.input.clone(),
+                                        category: Some("client".to_owned()),
+                                    },
+                                )
+                                .await?;
+                                emitted += 1;
+                                client_tool_proposed = true;
+                                info!(
+                                    tool_name = %call.tool_name,
+                                    "client-tool call proposed; handed back to caller (no kernel execution)"
+                                );
+                                continue;
+                            }
+
                             let guard_ctx = TurnContext {
                                 session_id: guard_context_template.session_id.clone(),
                                 branch_id: guard_context_template.branch_id.clone(),
@@ -1142,6 +1253,25 @@ impl KernelRuntime {
                             }
                         }
                     }
+                }
+
+                // Client-tool handoff: turn complete; the continuation
+                // arrives as a new dispatch with the client's tool result
+                // replayed into the history. Force `Sleep` so the
+                // dispatch loop breaks (mode ≠ Execute) and it is not
+                // treated as an error (mode ≠ Recover). The run still
+                // finishes through the normal `RunFinished` path below, so
+                // the wire emits TOOL_CALL_PENDING then FINISH. Two modes
+                // set earlier in this turn take precedence and are left
+                // untouched: `Recover` (e.g. a registry tool failed) and
+                // `AskHuman` (a registry tool enqueued an approval — the
+                // host must see the pending-approval signal or the next
+                // dispatch would early-return AskHuman with no model call
+                // and the approval would stall silently).
+                if client_tool_proposed
+                    && !matches!(mode, OperatingMode::Recover | OperatingMode::AskHuman)
+                {
+                    mode = OperatingMode::Sleep;
                 }
 
                 emitted += self

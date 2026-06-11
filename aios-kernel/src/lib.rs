@@ -172,6 +172,7 @@ impl AiosKernel {
                     proposed_tool,
                     system_prompt: None,
                     allowed_tools: None,
+                    client_tools: Vec::new(),
                     kind: TickKind::Direct,
                 },
             )
