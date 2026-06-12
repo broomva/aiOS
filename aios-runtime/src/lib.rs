@@ -609,6 +609,18 @@ impl KernelRuntime {
             .collect()
     }
 
+    /// The [`PolicySet`] a session was created with, deserialized from its
+    /// manifest. `None` when the session is unknown or its stored policy
+    /// JSON no longer matches the current `PolicySet` shape — callers must
+    /// treat `None` as "no policy-derived restriction available", never as
+    /// "allow everything was granted" (BRO-1466: drives tool VISIBILITY
+    /// only; the policy gate keeps enforcing at execution time either way).
+    pub fn session_policy(&self, session_id: &SessionId) -> Option<PolicySet> {
+        let sessions = self.sessions.lock();
+        let state = sessions.get(session_id.as_str())?;
+        serde_json::from_value(state.manifest.policy.clone()).ok()
+    }
+
     pub fn root_path(&self) -> &Path {
         &self.config.root
     }
@@ -1634,11 +1646,16 @@ impl KernelRuntime {
 
     /// Build conversation history from the session's event journal.
     ///
-    /// Reads prior events and extracts user objectives (from `DeliberationProposed`)
-    /// and assistant responses (from `Message` with role=assistant, or aggregated
-    /// `TextDelta` events). Returns a list of `ConversationTurn` entries in
-    /// chronological order, capped at the most recent 50 turns to avoid
-    /// context overflow.
+    /// Reads prior events and extracts user objectives (from `DeliberationProposed`),
+    /// assistant responses (from `Message` with role=assistant, or aggregated
+    /// `TextDelta` events), and the **tool transcript** (`ToolCallRequested` /
+    /// `ToolCallCompleted` / `ToolCallFailed`, rendered as bracketed lines inside
+    /// the assistant turn). Without the transcript the model has no evidence its
+    /// tools ever ran: observed live (BRO-1465 receipt, 2026-06-12) as gpt-5-mini
+    /// re-calling a SUCCESSFUL `write_file` on every continuation tick, and as
+    /// denial dead-air (a wrap-up call could not see `ToolCallFailed`).
+    /// Returns a list of `ConversationTurn` entries in chronological order,
+    /// capped at the most recent 50 turns to avoid context overflow.
     async fn build_conversation_history(
         &self,
         session_id: &SessionId,
@@ -1681,6 +1698,59 @@ impl KernelRuntime {
                 }
                 EventKind::TextDelta { delta, .. } => {
                     current_assistant_text.push_str(delta);
+                }
+                EventKind::ToolCallRequested {
+                    tool_name,
+                    arguments,
+                    category,
+                    ..
+                } => {
+                    // Client-category calls are handed back to the chat client;
+                    // their results return as ordinary conversation turns on the
+                    // next dispatch, so rendering them here would duplicate them.
+                    if category.as_deref() != Some("client") {
+                        append_tool_line(
+                            &mut current_assistant_text,
+                            &format!(
+                                "[tool_call {tool_name}({})]",
+                                truncate_for_history(
+                                    &arguments.to_string(),
+                                    TOOL_ARGS_HISTORY_BUDGET
+                                )
+                            ),
+                        );
+                    }
+                }
+                EventKind::ToolCallCompleted {
+                    tool_name,
+                    result,
+                    status,
+                    ..
+                } => {
+                    let status_label = match status {
+                        SpanStatus::Ok => "ok",
+                        SpanStatus::Error => "error",
+                        SpanStatus::Timeout => "timeout",
+                        SpanStatus::Cancelled => "cancelled",
+                    };
+                    append_tool_line(
+                        &mut current_assistant_text,
+                        &format!(
+                            "[tool_result {tool_name} {status_label}: {}]",
+                            truncate_for_history(&result.to_string(), TOOL_RESULT_HISTORY_BUDGET)
+                        ),
+                    );
+                }
+                EventKind::ToolCallFailed {
+                    tool_name, error, ..
+                } => {
+                    append_tool_line(
+                        &mut current_assistant_text,
+                        &format!(
+                            "[tool_result {tool_name} failed: {}]",
+                            truncate_for_history(error, TOOL_RESULT_HISTORY_BUDGET)
+                        ),
+                    );
                 }
                 EventKind::RunFinished { final_answer, .. } => {
                     // If we have a final answer and no accumulated text, use it.
@@ -2440,6 +2510,35 @@ impl KernelRuntime {
 fn sha256_json<T: Serialize>(value: &T) -> Result<String> {
     let payload = serde_json::to_vec(value)?;
     Ok(sha256_bytes(&payload))
+}
+
+/// Character budget for tool-call ARGUMENTS rendered into conversation
+/// history (`build_conversation_history`). Arguments can carry whole file
+/// bodies (`write_file.content`) — the model only needs enough to recognize
+/// what it already did.
+const TOOL_ARGS_HISTORY_BUDGET: usize = 600;
+
+/// Character budget for tool RESULTS rendered into conversation history.
+/// Results can be large (`read_file` returns hashline content for the whole
+/// file); the transcript exists so the model knows the call happened and how
+/// it ended, not to replay full payloads.
+const TOOL_RESULT_HISTORY_BUDGET: usize = 1200;
+
+/// Append a bracketed tool-transcript line to the in-progress assistant turn.
+fn append_tool_line(buffer: &mut String, line: &str) {
+    if !buffer.is_empty() {
+        buffer.push('\n');
+    }
+    buffer.push_str(line);
+}
+
+/// Truncate to `max_chars` characters (UTF-8 boundary safe), marking elision.
+fn truncate_for_history(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let cut: String = text.chars().take(max_chars).collect();
+    format!("{cut}… (truncated)")
 }
 
 /// Write the current OTel trace context (trace_id, span_id) into an EventRecord.
