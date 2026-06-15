@@ -107,6 +107,12 @@ pub struct TickOutput {
     pub state: AgentStateVector,
     pub events_emitted: u64,
     pub last_sequence: u64,
+    /// Registry tool calls evaluated this tick (gated, denied, or executed).
+    /// Dispatch loops continue on this — NOT on `mode == Execute`, which is
+    /// also the homeostatic default for text-only ticks and caused 4-5
+    /// wasted continuation model calls per chat turn (observed in prod,
+    /// 2026-06-12 session vcz5i4zq…).
+    pub tool_calls_executed: u32,
 }
 
 #[derive(Clone)]
@@ -695,7 +701,7 @@ impl KernelRuntime {
 
         let mut emitted = 0_u64;
         let mut previous_mode = Some(ctx.mode);
-        let mut _tool_calls_this_tick = 0_u32;
+        let mut tool_calls_this_tick = 0_u32;
         let mut _file_mutations_this_tick = 0_u32;
         let mut mode = ctx.mode;
 
@@ -744,8 +750,9 @@ impl KernelRuntime {
                 .finalize_tick(session_id, branch_id, manifest, state, &mode)
                 .await?;
             ctx.mode = mode;
+            // Early return before the directive loop — no tools ran.
             return self
-                .current_tick_output(session_id, branch_id, mode, (*state).clone(), emitted)
+                .current_tick_output(session_id, branch_id, mode, (*state).clone(), emitted, 0)
                 .await;
         }
 
@@ -879,9 +886,11 @@ impl KernelRuntime {
                 .await?;
             ctx.mode = mode;
             let _ = previous_mode; // suppress unused warning on this branch
-            let _ = (&mut _tool_calls_this_tick, &mut _file_mutations_this_tick);
+            let _ = (&mut tool_calls_this_tick, &mut _file_mutations_this_tick);
+            // Workflow ticks run their own internal loop (ergon) — one tick
+            // IS the whole turn, so the dispatch loop must not continue.
             return self
-                .current_tick_output(session_id, branch_id, mode, (*state).clone(), emitted)
+                .current_tick_output(session_id, branch_id, mode, (*state).clone(), emitted, 0)
                 .await;
         }
 
@@ -1099,7 +1108,7 @@ impl KernelRuntime {
                                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
                             // Track tool calls for per-tick Autonomic limits.
-                            _tool_calls_this_tick += 1;
+                            tool_calls_this_tick += 1;
                             if !policy.denied.is_empty() {
                                 mode = OperatingMode::Recover;
                                 state.error_streak += 1;
@@ -1217,7 +1226,7 @@ impl KernelRuntime {
                                         tool_run_id = %report.tool_run_id,
                                         exit_status = report.exit_status,
                                         mode = ?mode,
-                                        tool_calls = _tool_calls_this_tick,
+                                        tool_calls = tool_calls_this_tick,
                                         file_mutations = _file_mutations_this_tick,
                                         "tool execution completed"
                                     );
@@ -1357,8 +1366,15 @@ impl KernelRuntime {
             .await?;
         ctx.mode = mode;
         info!(mode = ?mode, emitted, "tick finalized");
-        self.current_tick_output(session_id, branch_id, mode, (*state).clone(), emitted)
-            .await
+        self.current_tick_output(
+            session_id,
+            branch_id,
+            mode,
+            (*state).clone(),
+            emitted,
+            tool_calls_this_tick,
+        )
+        .await
     }
 
     #[instrument(
@@ -2437,6 +2453,7 @@ impl KernelRuntime {
         mode: OperatingMode,
         state: AgentStateVector,
         events_emitted: u64,
+        tool_calls_executed: u32,
     ) -> Result<TickOutput> {
         Ok(TickOutput {
             session_id: session_id.clone(),
@@ -2444,6 +2461,7 @@ impl KernelRuntime {
             state,
             events_emitted,
             last_sequence: self.peek_last_sequence(session_id, branch_id)?,
+            tool_calls_executed,
         })
     }
 
